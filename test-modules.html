@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Module Test</title>
+</head>
+<body>
+    <h2>Testing Modules</h2>
+    <div id="output"></div>
+    
+    <script type="module">
+        // Test imports
+        import { 
+            textures, 
+            sounds, 
+            loadAllAssets, 
+            playSound 
+        } from './assets.js';
+        
+        import { 
+            MAP_WIDTH, 
+            MAP_HEIGHT, 
+            TILE_SIZE, 
+            map, 
+            isWall 
+        } from './map.js';
+
+        const output = document.getElementById('output');
+        
+        // Test basic functionality
+        console.log('Testing modules...');
+        output.innerHTML += 'MAP_WIDTH: ' + MAP_WIDTH + '<br>';
+        output.innerHTML += 'MAP_HEIGHT: ' + MAP_HEIGHT + '<br>';
+        output.innerHTML += 'TILE_SIZE: ' + TILE_SIZE + '<br>';
+        output.innerHTML += 'Map first row: ' + JSON.stringify(map[0]) + '<br>';
+        output.innerHTML += 'isWall(0, 0): ' + isWall(0, 0) + '<br>';
+        output.innerHTML += 'isWall(64, 64): ' + isWall(64, 64) + '<br>';
+        
+        // Test asset loading
+        loadAllAssets().then(() => {
+            output.innerHTML += 'Assets loaded successfully!<br>';
+            output.innerHTML += 'Textures array length: ' + textures.length + '<br>';
+            output.innerHTML += 'Sounds object keys: ' + Object.keys(sounds).join(', ') + '<br>';
+        }).catch(error => {
+            output.innerHTML += 'Error loading assets: ' + error + '<br>';
+        });
+        
+    </script>
+</body>
+</html>

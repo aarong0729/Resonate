@@ -1,0 +1,2589 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Simple Raycaster</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #222;
+            color: white;
+            font-family: monospace;
+        }
+        
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #222;
+            color: white;
+            font-family: monospace;
+        }
+        canvas {
+            border: 2px solid #555;
+            background: #000;
+            /* Display the 640×480 buffer at 1280×960 (2×) */
+            width: 1280px;
+            height: 960px;
+            image-rendering: pixelated;   /* keep chunky pixels sharp */
+        }
+        .controls {
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h2>Textured Raycaster - 2 Rooms, 2 Enemies</h2>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div class="controls">
+        <strong>Controls:</strong> WASD to move, Arrow keys to turn<br>
+        <strong>Weapons:</strong> 1 = Pistol, 2 = Shotgun, R to draw weapon or reload, Spacebar/Mouse Click to fire<br>
+        <strong>Combat:</strong> Pistol does 15 damage, Shotgun does 35 damage. Enemies drop ammo when killed.<br>
+        <strong>Power-ups:</strong> Health packs (+25-50 HP) and ammo boxes (+10-20 ammo) in room 2. Respawn after pickup.<br>
+        <strong>HUD:</strong> Score, Lives, Health%, Ammo displayed at bottom. Animated face shows health status.<br>
+        <strong>Goal:</strong> Kill all enemies to win! Use power-ups strategically to survive.<br>
+        <strong>Files:</strong> Uses health_pack.png, ammo_box.png (64x64 recommended), animated face textures<br>
+        <strong>Sprite Scale:</strong> Use +/- keys to adjust sprite size
+    </div>
+
+    <script>
+        // Get canvas and context
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        // Game settings
+        const SCREEN_WIDTH = 640;
+        const SCREEN_HEIGHT = 480;
+        // Height of the HUD bar drawn at the bottom of the screen
+        const HUD_HEIGHT = 80;
+        const MAP_WIDTH = 16;
+        const MAP_HEIGHT = 16;
+        const TILE_SIZE = 64;
+        const TEXTURE_SIZE = 64;
+        // Floor palette: index 0 = grass (outdoors), index 1 = wood (indoors)
+        // Floor palette: 0 = grass, 1 = wood, 2 = walkway (yellow-tan)
+        const floorPalette = [
+            [40, 90, 40],      // grass green
+            [150, 115, 60],    // wood brown
+            [185, 155, 95]     // yellow-tan walkway
+        ];
+        
+        // Sprite scaling factor (adjustable) - Much smaller to be proportional to walls
+        let spriteScaleFactor = 1.2;
+        
+        // Texture data
+        const textures = [];
+        let texturesLoaded = false;
+        
+        // -------------------- AUDIO --------------------
+        const sounds = {};
+        function loadSounds() {
+            [
+                ['player_draw',   'sounds/player_draw.wav'],
+                ['pistol_fire',   'sounds/pistol_fire.wav'],
+                ['shotgun_fire',  'sounds/shotgun_fire.wav'],
+                ['player_hurt',   'sounds/player_hurt.wav'],
+                ['player_die',    'sounds/player_die.wav'],
+                ['e1_spot',       'sounds/e1_spot.wav'],
+                ['e1_shoot',      'sounds/e1_shoot.wav'],
+                ['e1_hit',        'sounds/e1_hit.wav'],
+                ['e1_die',        'sounds/e1_die.wav'],
+                ['e2_spot',       'sounds/e2_spot.wav'],
+                ['e2_shoot',      'sounds/e2_shoot.wav'],
+                ['e2_hit',        'sounds/e2_hit.wav'],
+                ['e2_die',        'sounds/e2_die.wav'],
+                ['pickup_health', 'sounds/pickup_health.wav'],
+                ['pickup_ammo',   'sounds/pickup_ammo.wav']
+            ].forEach(([key,url]) => {
+                const a = new Audio(url);
+                a.preload = 'auto';
+                a.volume  = 0.6;
+                sounds[key] = a;
+            });
+            // Per-clip volume trim  (0 = mute, 1 = full)
+            const volumeMap = {
+                player_draw:   0.40,   // holster / reload – subtle
+                pistol_fire:   0.60,   // mid-level pop
+                shotgun_fire:  0.80,   // beefier blast
+                player_hurt:   0.90,   // make damage obvious
+                player_die:    1.00,   // full volume
+                pickup_health: 0.70,   // satisfying chime
+                pickup_ammo:   0.70
+            };
+
+            // Apply the custom levels
+            Object.entries(volumeMap).forEach(([k,v]) => {
+                if (sounds[k]) sounds[k].volume = v;
+            });
+        }
+        function playSound(key, v = 1.0) {
+            const s = sounds[key];
+            if (!s) return;
+            s.pause();
+            s.currentTime = 0;
+            s.volume = v;
+            s.play().catch(()=>{});
+        }
+        // ------------------------------------------------
+
+        // ---- Enemy sound helpers with distance roll-off ----
+        function getEnemyVolume(enemy) {
+            const dx = enemy.x - player.x;
+            const dy = enemy.y - player.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const maxDist = TILE_SIZE * 4;      // fade to minVol by 12 tiles
+            const minVol  = 0.15;                // still barely audible
+            let v = 1 - dist / maxDist;
+            return Math.max(minVol, Math.min(1, v));
+        }
+
+        function playEnemySound(enemy, suffix) {
+            const key = `${enemy.enemyType}_${suffix}`; // e.g. "e1_shoot"
+            playSound(key, getEnemyVolume(enemy));
+        }
+        // ----------------------------------------------------
+
+        // Z-buffer for sprite depth testing
+        const ZBuffer = new Array(SCREEN_WIDTH);
+        
+        // --- Screen-effects globals ---
+        let damageFlashDuration = 350;          // ms the red damage overlay lasts
+        let muzzleFlashDuration = 120;          // ms muzzle-flash overlay lasts
+        let muzzleFlashTime = 0;                // timestamp of last muzzle flash
+        let shakeDuration = 350;                // ms of screen shake after hit
+        let shakeMax = 8;                       // maximum shake amplitude in px
+        let screenShakeOffsetX = 0;
+        let screenShakeOffsetY = 0;
+        // --------------------------------
+        
+        // Simple 2-room map with different wall types: 0 = empty, 1 = stone, 2 = brick, 3 = wood, 4 = building, 5 = bar right, 6 = bar center, 7 = bar left, 8 = booth
+        const map = [
+            [1,1,1,1,1,1,1,1,1,1,8,8,8,8,38,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,7,6,37,5,0,3],
+            [1,0,0,0,0,0,0,0,4,4,3,3,3,3,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,0,0,0,0,0,0,0,4,4,0,0,0,0,0,3],
+            [1,1,1,1,1,1,1,1,1,1,3,3,3,3,3,3]
+        ];
+        
+        // Player with proper camera setup (like tutorial) + health system + HUD stats
+        const player = {
+            x: 1.5 * TILE_SIZE,  // Start position
+            y: 1.5 * TILE_SIZE,
+            // Direction vector (like tutorial)
+            dirX: -1.0,
+            dirY: 0.0,
+            // Camera plane (like tutorial) 
+            planeX: 0.0,
+            planeY: 0.66,
+            speed: 2,
+            turnSpeed: 0.05,
+            // Health system
+            health: 100,
+            maxHealth: 100,
+            lastHitTime: 0,
+            // HUD stats
+            lives: 3,
+            ammo: 50,
+            maxAmmo: 50,
+            walkTimer: 0,          // drives weapon bob
+            yaw: Math.PI,          // current facing angle (matches dirX = –1, dirY = 0)
+            targetYaw: Math.PI,    // desired facing angle
+        };
+        
+        // Enemies with animation info and shooting capabilities + HEALTH SYSTEM
+        const enemies = [
+            {
+                x: 2.5 * TILE_SIZE,
+                y: 11.5 * TILE_SIZE,
+                color: 'red',        // Fallback color
+                enemyType: 'e1',     // sound set to use
+                speed: 0.8,
+                walkTextureIndex: 8,     // Walking animation (8,9,10,11)
+                shootTextureIndex: 16,   // Shooting animation (16,17,18,19) 
+                deathTextureIndex: 24,   // Death animation (24,25,26,27)
+                currentFrame: 0,         // Current animation frame (0-3)
+                frameTimer: 0,           // Timer for frame switching
+                frameSpeed: 200,         // Animation speed
+                // Shooting properties
+                isWalking: true,         // true = walking animation, false = shooting animation
+                lastShotTime: 0,         // When enemy last shot
+                shootCooldown: 2000,     // 2 seconds between shots
+                shootDuration: 800,      // How long shooting animation lasts
+                shootStartTime: 0,       // When current shooting started
+                canSeePlayer: false,     // Line of sight to player
+                // HEALTH SYSTEM
+                health: 40,              // Enemy health points
+                maxHealth: 40,           // Maximum health
+                state: 'alive',          // 'alive', 'dying', 'dead'
+                deathStartTime: 0,       // When death animation started
+                deathDuration: 800,      // How long death animation lasts
+                hitFlashTime: 0,         // When enemy was last hit (for red flash effect)
+                hitFlashDuration: 150,   // How long hit flash lasts
+                aiState: "idle",         // Current AI behaviour state
+            },
+            {
+                x: 6.5 * TILE_SIZE,  // Right room - further from start
+                y: 13.5 * TILE_SIZE,
+                color: 'green',      // Fallback color
+                enemyType: 'e2',     // sound set to use
+                speed: 1.2,
+                walkTextureIndex: 12,    // Walking animation (12,13,14,15)
+                shootTextureIndex: 20,   // Shooting animation (20,21,22,23)
+                deathTextureIndex: 28,   // Death animation (28,29,30,31)
+                currentFrame: 0,         // Current animation frame (0-3)
+                frameTimer: 0,           // Timer for frame switching
+                frameSpeed: 200,         // Animation speed
+                // Shooting properties
+                isWalking: true,         // true = walking animation, false = shooting animation
+                lastShotTime: 0,         // When enemy last shot
+                shootCooldown: 1800,     // 1.8 seconds between shots
+                shootDuration: 800,      // How long shooting animation lasts
+                shootStartTime: 0,       // When current shooting started
+                canSeePlayer: false,     // Line of sight to player
+                // HEALTH SYSTEM
+                health: 30,              // Enemy health points (weaker than enemy1)
+                maxHealth: 30,           // Maximum health
+                state: 'alive',          // 'alive', 'dying', 'dead'
+                deathStartTime: 0,       // When death animation started
+                deathDuration: 800,      // How long death animation lasts
+                hitFlashTime: 0,         // When enemy was last hit (for red flash effect)
+                hitFlashDuration: 150,   // How long hit flash lasts
+                aiState: "idle",         // Current AI behaviour state
+            }
+        ];
+        
+        // ---- simple game-state ----
+        let gameState   = 'playing';   // 'playing' | 'victoryPending' | 'victory'
+        let victoryTime = 0;           // timestamp when last enemy died
+        const VICTORY_DELAY_MS = 3000; // 3-second pause before overlay
+        // Replay-button geometry
+        const REPLAY_BTN = { w: 220, h: 60 };
+
+        // Game statistics + Face animation
+        const gameStats = {
+            score: 0,
+            enemiesKilled: 0,
+            shotsHit: 0,
+            shotsFired: 0
+        };
+        
+        // Face animation system
+        const faceAnimation = {
+            currentFrame: 0,        // 0, 1, or 2 (for face1, face2, face3)
+            frameTimer: 0,          // Timer for animation
+            frameSpeed: 3000        // 3 seconds per frame
+        };
+        
+        // Projectile system
+        const projectiles = [];
+        const playerProjectiles = []; // Player's bullets
+        
+        // Power-ups & décor: 7 health, 2 ammo, 2 tables
+        const powerUps = [
+    // ─── Health packs (H) ───────────────────────────────────
+    { x:11.5*TILE_SIZE, y: 8.5*TILE_SIZE, type:'health', textureIndex:70, active:true, bobTimer:0,          bobSpeed:2000, bobHeight:8, respawnTime:30000, pickedUpTime:0 },
+    { x:13.5*TILE_SIZE, y: 8.5*TILE_SIZE, type:'health', textureIndex:70, active:true, bobTimer:Math.PI,    bobSpeed:2200, bobHeight:6, respawnTime:30000, pickedUpTime:0 },
+    { x:11.5*TILE_SIZE, y:11.5*TILE_SIZE, type:'health', textureIndex:70, active:true, bobTimer:Math.PI/2,  bobSpeed:2100, bobHeight:7, respawnTime:30000, pickedUpTime:0 },
+    { x:13.5*TILE_SIZE, y:11.5*TILE_SIZE, type:'health', textureIndex:70, active:true, bobTimer:Math.PI*0.8,bobSpeed:1900, bobHeight:6, respawnTime:30000, pickedUpTime:0 },
+    { x:12.5*TILE_SIZE, y:12.5*TILE_SIZE, type:'health', textureIndex:70, active:true, bobTimer:Math.PI*1.2,bobSpeed:2000, bobHeight:8, respawnTime:30000, pickedUpTime:0 },
+    { x:11.5*TILE_SIZE, y:13.5*TILE_SIZE, type:'health', textureIndex:70, active:true, bobTimer:Math.PI*1.6,bobSpeed:2100, bobHeight:7, respawnTime:30000, pickedUpTime:0 },
+    { x:13.5*TILE_SIZE, y:13.5*TILE_SIZE, type:'health', textureIndex:70, active:true, bobTimer:Math.PI*0.3,bobSpeed:1900, bobHeight:6, respawnTime:30000, pickedUpTime:0 },
+
+    // ─── Ammo boxes (A) ────────────────────────────────────
+    { x:11.5*TILE_SIZE, y: 1.5*TILE_SIZE, type:'ammo',   textureIndex:71, active:true, bobTimer:0,          bobSpeed:2200, bobHeight:6, respawnTime:25000, pickedUpTime:0 },
+    { x:13.5*TILE_SIZE, y: 1.5*TILE_SIZE, type:'ammo',   textureIndex:71, active:true, bobTimer:Math.PI,    bobSpeed:2100, bobHeight:5, respawnTime:25000, pickedUpTime:0 },
+
+    // ─── Tables (T) – décor only ──────────────────────────
+    { x:11.5*TILE_SIZE, y: 3.5*TILE_SIZE, type:'table',  textureIndex:72, active:true, bobTimer:0, bobSpeed:0, bobHeight:0, respawnTime:0, pickedUpTime:0 },
+    { x:13.5*TILE_SIZE, y: 3.5*TILE_SIZE, type:'table',  textureIndex:72, active:true, bobTimer:0, bobSpeed:0, bobHeight:0, respawnTime:0, pickedUpTime:0 }
+    ];
+        
+        // Weapon system
+        const weapons = [
+            // Pistol (Weapon 1)
+            {
+                name: 'Pistol',
+                isVisible: false,
+                state: 'hidden', // 'hidden', 'coming_up', 'ready', 'firing'
+                currentFrame: 0,
+                frameTimer: 0,
+                frameSpeed: 150, // Animation speed in ms
+                upTextures: [40, 41], // weapon_up1.png, weapon_up2.png (textures 40-41)
+                fireTextures: [42, 43], // weapon_fire1.png, weapon_fire2.png (textures 42-43)
+                fireAnimationTime: 200, // How long fire animation lasts
+                fireRate: 150,         // ms between shots when trigger held
+                lastShotTime: 0,       // timestamp of most recent shot
+                fireStartTime: 0,
+                damage: 15,            // damage per shot
+                soundName: 'pistol_fire'
+            },
+            // Shotgun (Weapon 2)
+            {
+                name: 'Shotgun',
+                isVisible: false,
+                state: 'hidden', // 'hidden', 'coming_up', 'ready', 'firing'
+                currentFrame: 0,
+                frameTimer: 0,
+                frameSpeed: 150, // Animation speed in ms
+                upTextures: [44, 45], // shotgun_up1.png, shotgun_up2.png (textures 44-45)
+                fireTextures: [46, 47], // shotgun_fire1.png, shotgun_fire2.png (textures 46-47)
+                fireAnimationTime: 300, // How long fire animation lasts
+                fireRate: 400,         // ms between shots when trigger held (slower than pistol)
+                lastShotTime: 0,       // timestamp of most recent shot
+                fireStartTime: 0,
+                damage: 35,            // damage per shot (higher than pistol)
+                soundName: 'shotgun_fire'
+            }
+        ];
+        
+        let currentWeapon = 0; // 0 = pistol, 1 = shotgun
+        
+        // Input handling
+        const keys = {};
+        window.addEventListener('keydown', (e) => {
+            keys[e.key] = true;
+            
+            // Weapon switching
+            if (e.key === '1') {
+                switchWeapon(0); // Switch to pistol
+            }
+            if (e.key === '2') {
+                switchWeapon(1); // Switch to shotgun
+            }
+            
+            // Weapon controls
+            if (e.key === 'r' || e.key === 'R') {
+                const weapon = weapons[currentWeapon];
+                if (weapon.state === 'hidden') {
+                    weapon.state = 'coming_up';
+                    weapon.currentFrame = 0;
+                    weapon.frameTimer = 0;
+                    weapon.isVisible = true;
+                    console.log(`Drawing ${weapon.name}...`);
+                    playSound('player_draw');
+                } else if (weapon.state === 'ready' && player.ammo < player.maxAmmo) {
+                    // Reload weapon
+                    player.ammo = player.maxAmmo;
+                    console.log(`${weapon.name} reloaded!`);
+                    playSound('player_draw');
+                }
+            }
+            
+            // Shooting
+            if (e.key === ' ') { // Spacebar
+                shootPlayer();
+            }
+            
+            // Sprite scaling controls
+            if (e.key === '=' || e.key === '+') {
+                spriteScaleFactor += 0.5;
+                console.log('Sprite scale factor:', spriteScaleFactor.toFixed(1));
+            }
+            if (e.key === '-') {
+                spriteScaleFactor = Math.max(0.5, spriteScaleFactor - 0.5);
+                console.log('Sprite scale factor:', spriteScaleFactor.toFixed(1));
+            }
+        });
+        window.addEventListener('keyup', (e) => keys[e.key] = false);
+        
+        // Mouse shooting (only while playing)
+        canvas.addEventListener('click', (e) => {
+            if (gameState !== 'playing') return;  // Ignore clicks on overlays
+            shootPlayer();
+        });
+        
+        // Replay button click
+        canvas.addEventListener('click', (evt) => {
+            if (gameState !== 'victory') return;
+
+                const rect = canvas.getBoundingClientRect();
+                const scaleX = canvas.width  / rect.width;   // 640 / 1280 = 0.5
+                const scaleY = canvas.height / rect.height;  // 480 / 960  = 0.5
+                const mx = (evt.clientX - rect.left) * scaleX;
+                const my = (evt.clientY - rect.top)  * scaleY;
+
+            const btnX = SCREEN_WIDTH / 2 - REPLAY_BTN.w / 2;
+            const btnY = SCREEN_HEIGHT / 2 + 20;
+
+            if (mx >= btnX && mx <= btnX + REPLAY_BTN.w &&
+                my >= btnY && my <= btnY + REPLAY_BTN.h) {
+                location.reload();   // restart the game
+            }
+        });
+        
+        // Weapon switching function
+        function switchWeapon(weaponIndex) {
+            if (weaponIndex < 0 || weaponIndex >= weapons.length) return;
+            if (weaponIndex === currentWeapon) return; // Already using this weapon
+            
+            // Hide current weapon
+            weapons[currentWeapon].state = 'hidden';
+            weapons[currentWeapon].isVisible = false;
+            
+            // Switch to new weapon and immediately draw it
+            currentWeapon = weaponIndex;
+            const newWeapon = weapons[currentWeapon];
+            newWeapon.state = 'coming_up';
+            newWeapon.currentFrame = 0;
+            newWeapon.frameTimer = 0;
+            newWeapon.isVisible = true;
+            
+            console.log(`Switched to ${newWeapon.name}`);
+            playSound('player_draw');
+        }
+
+        // Player shooting function
+        function shootPlayer() {
+            const weapon = weapons[currentWeapon];
+            // Only shoot if weapon is ready AND has ammo
+            if (weapon.state === 'ready' && player.ammo > 0) {
+                // Start firing animation
+                weapon.state = 'firing';
+                weapon.currentFrame = 0;
+                weapon.frameTimer = 0;
+                weapon.fireStartTime = Date.now();
+                
+                // Consume ammo
+                player.ammo--;
+                if (sounds[weapon.soundName]) {
+                    const clip = sounds[weapon.soundName].cloneNode();
+                    clip.volume = sounds[weapon.soundName].volume;
+                    clip.play().catch(()=>{});
+                }
+                
+                // Create bullet
+                const speed = 8; // Player bullets are faster
+                const bullet = {
+                    x: player.x,
+                    y: player.y,
+                    vx: player.dirX * speed,
+                    vy: player.dirY * speed,
+                    lifetime: 1000, // 1 second lifetime
+                    damage: weapon.damage,     // Bullet damage from current weapon
+                    color: 'cyan'
+                };
+                playerProjectiles.push(bullet);
+                gameStats.shotsFired++; // Track shots fired
+                console.log(`Player fired weapon! Ammo: ${player.ammo}/${player.maxAmmo}`);
+            } else if (weapons[currentWeapon].state === 'hidden') {
+                console.log('Press R to draw weapon first!');
+            } else if (player.ammo <= 0) {
+                console.log('Out of ammo! Need to find more ammunition.');
+            }
+        }
+        
+        // Update weapon animation
+        function updateWeapon(deltaTime) {
+            const weapon = weapons[currentWeapon];
+            const currentTime = Date.now();
+            
+            if (weapon.state === 'coming_up') {
+                weapon.frameTimer += deltaTime;
+                if (weapon.frameTimer >= weapon.frameSpeed) {
+                    weapon.frameTimer = 0;
+                    weapon.currentFrame++;
+                    
+                    if (weapon.currentFrame >= weapon.upTextures.length) {
+                        weapon.state = 'ready';
+                        weapon.currentFrame = weapon.upTextures.length - 1; // Stay on last frame
+                        console.log(`${weapon.name} ready!`);
+                    }
+                }
+            } else if (weapon.state === 'firing') {
+                weapon.frameTimer += deltaTime;
+                if (weapon.frameTimer >= weapon.frameSpeed) {
+                    weapon.frameTimer = 0;
+                    weapon.currentFrame++;
+                    
+                    if (weapon.currentFrame >= weapon.fireTextures.length) {
+                        weapon.currentFrame = 0; // Loop fire animation
+                    }
+                }
+                
+                // End firing animation after set time
+                if (currentTime - weapon.fireStartTime >= weapon.fireAnimationTime) {
+                    weapon.state = 'ready';
+                    weapon.currentFrame = weapon.upTextures.length - 1; // Back to ready frame
+                }
+            }
+        }
+
+        // ── Handle automatic fire when Spacebar is held ──
+        function handleAutoFire() {
+            const weapon = weapons[currentWeapon];
+            const now = Date.now();
+             if (keys[' '] && weapon.state === 'ready' && player.ammo > 0) {
+                if (now - weapon.lastShotTime >= weapon.fireRate) {
+                    shootPlayer();                // reuse existing routine
+                    weapon.lastShotTime = now;
+                 }
+            }
+        }
+        
+        // Load PNG texture and extract pixel data
+        function loadTexture(imagePath, textureIndex) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = function() {
+                    // Create a temporary canvas to extract pixel data
+                    const tempCanvas = document.createElement('canvas');
+                    const tempCtx = tempCanvas.getContext('2d');
+                    
+                    tempCanvas.width = TEXTURE_SIZE;
+                    tempCanvas.height = TEXTURE_SIZE;
+                    
+                    // Draw the image scaled to our texture size
+                    tempCtx.drawImage(img, 0, 0, TEXTURE_SIZE, TEXTURE_SIZE);
+                    
+                    // Get pixel data
+                    const imageData = tempCtx.getImageData(0, 0, TEXTURE_SIZE, TEXTURE_SIZE);
+                    const pixels = imageData.data;
+                    
+                    // Convert to our texture format (including alpha channel)
+                    textures[textureIndex] = [];
+                    for (let y = 0; y < TEXTURE_SIZE; y++) {
+                        textures[textureIndex][y] = [];
+                        for (let x = 0; x < TEXTURE_SIZE; x++) {
+                            const i = (y * TEXTURE_SIZE + x) * 4;
+                            textures[textureIndex][y][x] = [
+                                pixels[i],     // Red
+                                pixels[i + 1], // Green  
+                                pixels[i + 2], // Blue
+                                pixels[i + 3]  // Alpha (transparency)
+                            ];
+                        }
+                    }
+                    console.log(`Loaded texture: ${imagePath}`);
+                    resolve();
+                };
+                img.onerror = function() {
+                    console.error(`Failed to load texture: ${imagePath}`);
+                    reject();
+                };
+                img.src = imagePath;
+            });
+        }
+        
+        // Generate procedural textures and load PNG textures  
+        async function generateTextures() {
+            // Try to load wall textures first, with procedural fallbacks
+            
+            // Try to load stone wall texture
+            try {
+                await loadTexture('textures/stone_wall.png', 0);
+            } catch (error) {
+                console.log('Could not load stone_wall.png, using procedural stone texture');
+                // Procedural stone texture fallback
+                textures[0] = [];
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    textures[0][y] = [];
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const blockX = Math.floor(x / 16);
+                        const blockY = Math.floor(y / 16);
+                        const edgeX = (x % 16 === 0 || x % 16 === 15);
+                        const edgeY = (y % 16 === 0 || y % 16 === 15);
+                        
+                        if (edgeX || edgeY) {
+                            textures[0][y][x] = [100, 100, 100, 255]; // Dark gray edges
+                        } else {
+                            const noise = Math.random() * 40;
+                            textures[0][y][x] = [140 + noise, 120 + noise, 100 + noise, 255];
+                        }
+                    }
+                }
+            }
+            
+            // Texture 1: Red brick (procedural)
+            textures[1] = [];
+            for (let y = 0; y < TEXTURE_SIZE; y++) {
+                textures[1][y] = [];
+                for (let x = 0; x < TEXTURE_SIZE; x++) {
+                    const brickY = Math.floor(y / 8);
+                    const offsetX = (brickY % 2) * 16;
+                    const brickX = Math.floor((x + offsetX) / 32);
+                    
+                    const edgeX = ((x + offsetX) % 32 === 0 || (x + offsetX) % 32 === 31);
+                    const edgeY = (y % 8 === 0 || y % 8 === 7);
+                    
+                    if (edgeX || edgeY) {
+                        textures[1][y][x] = [80, 60, 40, 255]; // Dark mortar
+                    } else {
+                        const noise = Math.random() * 30;
+                        textures[1][y][x] = [180 + noise, 80 + noise, 60 + noise, 255];
+                    }
+                }
+            }
+            
+            // Texture 2: Wood planks (procedural)
+            textures[2] = [];
+            for (let y = 0; y < TEXTURE_SIZE; y++) {
+                textures[2][y] = [];
+                for (let x = 0; x < TEXTURE_SIZE; x++) {
+                    const plankY = Math.floor(y / 8);
+                    const edgeY = (y % 8 === 0 || y % 8 === 7);
+                    
+                    if (edgeY) {
+                        textures[2][y][x] = [60, 40, 20, 255]; // Dark wood lines
+                    } else {
+                        const noise = Math.random() * 20;
+                        const grain = Math.sin(x * 0.3) * 10;
+                        textures[2][y][x] = [120 + noise + grain, 80 + noise + grain, 40 + noise, 255];
+                    }
+                }
+            }
+            
+            // Try to load building_1.png for texture 3
+            try {
+                await loadTexture('textures/building_1.png', 3);
+            } catch (error) {
+                console.log('Could not load building_1.png, using procedural building texture');
+                // Procedural building texture fallback
+                textures[3] = [];
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    textures[3][y] = [];
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const noise = Math.random() * 20;
+                        const windowPattern = (Math.floor(x / 8) + Math.floor(y / 12)) % 2;
+                        
+                        if (windowPattern === 0) {
+                            textures[3][y][x] = [120 + noise, 120 + noise, 130 + noise, 255];
+                        } else {
+                            textures[3][y][x] = [80 + noise, 90 + noise, 100 + noise, 255];
+                        }
+                    }
+                }
+            }
+            
+            // Try to load bar_2r.png for texture 4
+            try {
+                await loadTexture('textures/bar_2r.png', 4);
+            } catch (error) {
+                console.log('Could not load bar_2r.png, using procedural bar right texture');
+                // Procedural bar right texture fallback
+                textures[4] = [];
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    textures[4][y] = [];
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const noise = Math.random() * 15;
+                        if (x > TEXTURE_SIZE - 8) {
+                            textures[4][y][x] = [80 + noise, 50 + noise, 30 + noise, 255];
+                        } else {
+                            const grain = Math.sin(y * 0.2) * 10;
+                            textures[4][y][x] = [140 + noise + grain, 100 + noise + grain, 60 + noise, 255];
+                        }
+                    }
+                }
+            }
+            
+            // Try to load bar_1.png for texture 5
+            try {
+                await loadTexture('textures/bar_1.png', 5);
+            } catch (error) {
+                console.log('Could not load bar_1.png, using procedural bar center texture');
+                // Procedural bar center texture fallback
+                textures[5] = [];
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    textures[5][y] = [];
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const noise = Math.random() * 15;
+                        const grain = Math.sin(y * 0.2) * 10;
+                        textures[5][y][x] = [140 + noise + grain, 100 + noise + grain, 60 + noise, 255];
+                    }
+                }
+            }
+            
+            // Try to load bar_2l.png for texture 6
+            try {
+                await loadTexture('textures/bar_2l.png', 6);
+            } catch (error) {
+                console.log('Could not load bar_2l.png, using procedural bar left texture');
+                // Procedural bar left texture fallback
+                textures[6] = [];
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    textures[6][y] = [];
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const noise = Math.random() * 15;
+                        if (x < 8) {
+                            textures[6][y][x] = [80 + noise, 50 + noise, 30 + noise, 255];
+                        } else {
+                            const grain = Math.sin(y * 0.2) * 10;
+                            textures[6][y][x] = [140 + noise + grain, 100 + noise + grain, 60 + noise, 255];
+                        }
+                    }
+                }
+            }
+            
+            // Try to load booth.png for texture 7
+            try {
+                await loadTexture('textures/booth.png', 7);
+            } catch (error) {
+                console.log('Could not load booth.png, using procedural booth texture');
+                // Procedural booth texture fallback
+                textures[7] = [];
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    textures[7][y] = [];
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const noise = Math.random() * 20;
+                        const buttonPattern = (Math.floor(x / 16) + Math.floor(y / 16)) % 2;
+                        const padding = Math.sin(x * 0.3) * Math.sin(y * 0.3) * 15;
+                        
+                        if (buttonPattern === 0) {
+                            textures[7][y][x] = [60 + noise, 40 + noise, 30 + noise, 255];
+                        } else {
+                            textures[7][y][x] = [100 + noise + padding, 60 + noise + padding, 50 + noise + padding, 255];
+                        }
+                    }
+                }
+            }
+
+            // --- NEW WALL TEXTURES (map values 37 & 38 → texture indices 36 & 37) ---
+// Try to load bar_1c.png for texture 36
+try {
+    await loadTexture('textures/bar_1c.png', 36);
+    console.log('Loaded bar_1c.png into texture 36');
+} catch (error) {
+    console.log('Could not load bar_1c.png, using procedural fallback');
+    textures[36] = [];
+    for (let y = 0; y < TEXTURE_SIZE; y++) {
+        textures[36][y] = [];
+        for (let x = 0; x < TEXTURE_SIZE; x++) {
+            const noise = Math.random() * 15;
+            const grain = Math.sin(y * 0.25) * 8;
+            textures[36][y][x] = [120 + noise + grain, 80 + noise + grain, 50 + noise, 255];
+        }
+    }
+}
+
+// Try to load booth2.png for texture 37
+try {
+    await loadTexture('textures/booth2.png', 37);
+    console.log('Loaded booth2.png into texture 37');
+} catch (error) {
+    console.log('Could not load booth2.png, using procedural fallback');
+    textures[37] = [];
+    for (let y = 0; y < TEXTURE_SIZE; y++) {
+        textures[37][y] = [];
+        for (let x = 0; x < TEXTURE_SIZE; x++) {
+            const noise = Math.random() * 20;
+            const pattern = (Math.floor(x / 16) + Math.floor(y / 16)) % 2;
+            if (pattern === 0) {
+                textures[37][y][x] = [70 + noise, 50 + noise, 35 + noise, 255];
+            } else {
+                textures[37][y][x] = [110 + noise, 70 + noise, 60 + noise, 255];
+            }
+        }
+    }
+}
+// ----------------------------------------------------------------------
+            
+            // Try to load enemy1 walking animation frames (textures 8-11)
+            try {
+                await loadTexture('textures/enemy1_walk1.png', 8);
+                await loadTexture('textures/enemy1_walk2.png', 9);
+                await loadTexture('textures/enemy1_walk3.png', 10);
+                await loadTexture('textures/enemy1_walk4.png', 11);
+                console.log('Loaded enemy1 walking animation frames');
+            } catch (error) {
+                console.log('Could not load enemy1 walking frames, using procedural enemy1 textures');
+                // Procedural enemy1 walking frames fallback
+                for (let frame = 0; frame < 4; frame++) {
+                    textures[8 + frame] = [];
+                    for (let y = 0; y < TEXTURE_SIZE; y++) {
+                        textures[8 + frame][y] = [];
+                        for (let x = 0; x < TEXTURE_SIZE; x++) {
+                            const centerX = TEXTURE_SIZE / 2;
+                            const centerY = TEXTURE_SIZE / 2;
+                            const distance = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
+                            const noise = Math.random() * 30;
+                            const frameVariation = Math.sin(frame * Math.PI / 2) * 10;
+                            
+                            if (distance < TEXTURE_SIZE / 3) {
+                                const bodyPattern = Math.sin(x * 0.3) * Math.sin(y * 0.3) * 20;
+                                textures[8 + frame][y][x] = [200 + noise + bodyPattern + frameVariation, 50 + noise, 50 + noise, 255];
+                            } else if (distance < TEXTURE_SIZE / 2.5) {
+                                textures[8 + frame][y][x] = [120 + noise, 30 + noise, 30 + noise, 255];
+                            } else {
+                                textures[8 + frame][y][x] = [0, 0, 0, 0];
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try to load enemy2 walking aniation frames (textures 12-15)
+            try {
+                await loadTexture('textures/enemy2_walk1.png', 12);
+                await loadTexture('textures/enemy2_walk2.png', 13);
+                await loadTexture('textures/enemy2_walk3.png', 14);
+                await loadTexture('textures/enemy2_walk4.png', 15);
+                console.log('Loaded enemy2 walking animation frames');
+            } catch (error) {
+                console.log('Could not load enemy2 walking frames, using procedural enemy2 textures');
+                // Procedural enemy2 frames fallback
+                for (let frame = 0; frame < 4; frame++) {
+                    textures[12 + frame] = [];
+                    for (let y = 0; y < TEXTURE_SIZE; y++) {
+                        textures[12 + frame][y] = [];
+                        for (let x = 0; x < TEXTURE_SIZE; x++) {
+                            const centerX = TEXTURE_SIZE / 2;
+                            const centerY = TEXTURE_SIZE / 2;
+                            const distance = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
+                            const noise = Math.random() * 30;
+                            const frameVariation = Math.sin(frame * Math.PI / 2) * 10;
+                            
+                            if (distance < TEXTURE_SIZE / 3) {
+                                const bodyPattern = Math.sin(x * 0.2) * Math.sin(y * 0.4) * 20;
+                                textures[12 + frame][y][x] = [50 + noise, 200 + noise + bodyPattern + frameVariation, 50 + noise, 255];
+                            } else if (distance < TEXTURE_SIZE / 2.5) {
+                                textures[12 + frame][y][x] = [30 + noise, 120 + noise, 30 + noise, 255];
+                            } else {
+                                textures[12 + frame][y][x] = [0, 0, 0, 0];
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try to load enemy1 shooting animation frames (textures 16-19)
+            try {
+                await loadTexture('textures/enemy1_shoot1.png', 16);
+                await loadTexture('textures/enemy1_shoot2.png', 17);
+                await loadTexture('textures/enemy1_shoot3.png', 18);
+                await loadTexture('textures/enemy1_shoot4.png', 19);
+                console.log('Loaded enemy1 shooting animation frames');
+            } catch (error) {
+                console.log('Could not load enemy1 shooting frames, using procedural shooting textures');
+                // Copy walking animation and modify for shooting (better fallback)
+                for (let frame = 0; frame < 4; frame++) {
+                    if (textures[8 + frame]) {
+                        textures[16 + frame] = JSON.parse(JSON.stringify(textures[8 + frame]));
+                        
+                        // Add muzzle flash effect by brightening certain areas
+                        if (frame === 1 || frame === 2) {
+                            for (let y = 0; y < TEXTURE_SIZE; y++) {
+                                for (let x = 0; x < TEXTURE_SIZE; x++) {
+                                    if (textures[16 + frame][y] && textures[16 + frame][y][x]) {
+                                        const pixel = textures[16 + frame][y][x];
+                                        pixel[0] = Math.min(255, pixel[0] + 50);
+                                        pixel[1] = Math.min(255, pixel[1] + 50);
+                                        pixel[2] = Math.min(255, pixel[2] + 30);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try to load enemy2 shooting animation frames (textures 20-23)
+            try {
+                await loadTexture('textures/enemy2_shoot1.png', 20);
+                await loadTexture('textures/enemy2_shoot2.png', 21);
+                await loadTexture('textures/enemy2_shoot3.png', 22);
+                await loadTexture('textures/enemy2_shoot4.png', 23);
+                console.log('Loaded enemy2 shooting animation frames');
+            } catch (error) {
+                console.log('Could not load enemy2 shooting frames, using procedural shooting textures');
+                // Copy walking animation and modify for shooting (better fallback)
+                for (let frame = 0; frame < 4; frame++) {
+                    if (textures[12 + frame]) {
+                        textures[20 + frame] = JSON.parse(JSON.stringify(textures[12 + frame]));
+                        
+                        // Add muzzle flash effect by brightening certain areas
+                        if (frame === 1 || frame === 2) {
+                            for (let y = 0; y < TEXTURE_SIZE; y++) {
+                                for (let x = 0; x < TEXTURE_SIZE; x++) {
+                                    if (textures[20 + frame][y] && textures[20 + frame][y][x]) {
+                                        const pixel = textures[20 + frame][y][x];
+                                        pixel[0] = Math.min(255, pixel[0] + 50);
+                                        pixel[1] = Math.min(255, pixel[1] + 50);
+                                        pixel[2] = Math.min(255, pixel[2] + 30);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try to load enemy1 death animation frames (textures 24-27)
+            try {
+                await loadTexture('textures/enemy1_death1.png', 24);
+                await loadTexture('textures/enemy1_death2.png', 25);
+                await loadTexture('textures/enemy1_death3.png', 26);
+                await loadTexture('textures/enemy1_death4.png', 27);
+                console.log('Loaded enemy1 death animation frames');
+            } catch (error) {
+                console.log('Could not load enemy1 death frames, using procedural death textures');
+                // Create procedural death animation (fading red)
+                for (let frame = 0; frame < 4; frame++) {
+                    textures[24 + frame] = [];
+                    const fadeFactor = 1 - (frame / 4); // Fade out over 4 frames
+                    for (let y = 0; y < TEXTURE_SIZE; y++) {
+                        textures[24 + frame][y] = [];
+                        for (let x = 0; x < TEXTURE_SIZE; x++) {
+                            const centerX = TEXTURE_SIZE / 2;
+                            const centerY = TEXTURE_SIZE / 2;
+                            const distance = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
+                            
+                            if (distance < TEXTURE_SIZE / 3) {
+                                // Fading red death effect
+                                const intensity = Math.floor(150 * fadeFactor);
+                                textures[24 + frame][y][x] = [intensity, 0, 0, Math.floor(255 * fadeFactor)];
+                            } else {
+                                textures[24 + frame][y][x] = [0, 0, 0, 0]; // Transparent
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try to load enemy2 death animation frames (textures 28-31)
+            try {
+                await loadTexture('textures/enemy2_death1.png', 28);
+                await loadTexture('textures/enemy2_death2.png', 29);
+                await loadTexture('textures/enemy2_death3.png', 30);
+                await loadTexture('textures/enemy2_death4.png', 31);
+                console.log('Loaded enemy2 death animation frames');
+            } catch (error) {
+                console.log('Could not load enemy2 death frames, using procedural death textures');
+                // Create procedural death animation (fading green)
+                for (let frame = 0; frame < 4; frame++) {
+                    textures[28 + frame] = [];
+                    const fadeFactor = 1 - (frame / 4); // Fade out over 4 frames
+                    for (let y = 0; y < TEXTURE_SIZE; y++) {
+                        textures[28 + frame][y] = [];
+                        for (let x = 0; x < TEXTURE_SIZE; x++) {
+                            const centerX = TEXTURE_SIZE / 2;
+                            const centerY = TEXTURE_SIZE / 2;
+                            const distance = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
+                            
+                            if (distance < TEXTURE_SIZE / 3) {
+                                // Fading green death effect
+                                const intensity = Math.floor(150 * fadeFactor);
+                                textures[28 + frame][y][x] = [0, intensity, 0, Math.floor(255 * fadeFactor)];
+                            } else {
+                                textures[28 + frame][y][x] = [0, 0, 0, 0]; // Transparent
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try to load weapon textures (textures 40-47)
+            try {
+                // Pistol textures (40-43)
+                await loadTexture('textures/weapon_up1.png', 40);
+                await loadTexture('textures/weapon_up2.png', 41);
+                await loadTexture('textures/weapon_fire1.png', 42);
+                await loadTexture('textures/weapon_fire2.png', 43);
+                // Shotgun textures (44-47)
+                await loadTexture('textures/shotgun_up1.png', 44);
+                await loadTexture('textures/shotgun_up2.png', 45);
+                await loadTexture('textures/shotgun_fire1.png', 46);
+                await loadTexture('textures/shotgun_fire2.png', 47);
+                console.log('Loaded weapon textures');
+            } catch (error) {
+                console.log('Could not load weapon textures, using procedural weapon textures');
+                // Create procedural weapon textures (simple gun shape)
+                for (let texIndex = 40; texIndex < 48; texIndex++) {
+                    textures[texIndex] = [];
+                    for (let y = 0; y < TEXTURE_SIZE; y++) {
+                        textures[texIndex][y] = [];
+                        for (let x = 0; x < TEXTURE_SIZE; x++) {
+                            const centerX = TEXTURE_SIZE / 2;
+                            const isFiring = (texIndex === 42 || texIndex === 43);
+                            
+                            // Create a simple gun shape
+                            if (y > TEXTURE_SIZE * 0.3) { // Gun body
+                                if (x > centerX - 8 && x < centerX + 8) {
+                                    // Gun barrel
+                                    const baseColor = isFiring ? [255, 255, 100] : [80, 80, 80];
+                                    textures[texIndex][y][x] = [...baseColor, 255];
+                                } else if (y > TEXTURE_SIZE * 0.7 && x > centerX - 16 && x < centerX + 16) {
+                                    // Gun handle
+                                    textures[texIndex][y][x] = [60, 40, 20, 255];
+                                } else {
+                                    textures[texIndex][y][x] = [0, 0, 0, 0]; // Transparent
+                                }
+                            } else {
+                                textures[texIndex][y][x] = [0, 0, 0, 0]; // Transparent
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try to load HUD face images (3 frames per health state, with fallbacks)
+            // Texture mapping: 50-52 (100%), 53-55 (75%), 56-58 (50%), 59-61 (25%), 62-64 (dead)
+            
+            const healthStates = ['100', '75', '50', '25', 'dead'];
+            let loadedAnimatedFaces = 0;
+            
+            for (let stateIndex = 0; stateIndex < healthStates.length; stateIndex++) {
+                const healthState = healthStates[stateIndex];
+                const baseTextureIndex = 50 + stateIndex * 3;
+                
+                try {
+                    // Try to load all 3 frames for this health state
+                    await loadTexture(`textures/face1_${healthState}.png`, baseTextureIndex);
+                    console.log(`Loaded face1_${healthState}.png`);
+                    
+                    // Try to load frame 2
+                    try {
+                        await loadTexture(`textures/face2_${healthState}.png`, baseTextureIndex + 1);
+                        console.log(`Loaded face2_${healthState}.png`);
+                    } catch (error) {
+                        // If frame 2 doesn't exist, copy frame 1
+                        console.log(`face2_${healthState}.png not found, using face1_${healthState}.png`);
+                        textures[baseTextureIndex + 1] = JSON.parse(JSON.stringify(textures[baseTextureIndex]));
+                    }
+                    
+                    // Try to load frame 3
+                    try {
+                        await loadTexture(`textures/face3_${healthState}.png`, baseTextureIndex + 2);
+                        console.log(`Loaded face3_${healthState}.png`);
+                    } catch (error) {
+                        // If frame 3 doesn't exist, copy frame 1
+                        console.log(`face3_${healthState}.png not found, using face1_${healthState}.png`);
+                        textures[baseTextureIndex + 2] = JSON.parse(JSON.stringify(textures[baseTextureIndex]));
+                    }
+                    
+                    loadedAnimatedFaces++;
+                    
+                } catch (error) {
+                    console.log(`Could not load face1_${healthState}.png`);
+                    // If we can't load the base frame, this health state fails
+                    // Will be handled by fallback system below
+                }
+            }
+            
+            if (loadedAnimatedFaces > 0) {
+                console.log(`Loaded animated faces for ${loadedAnimatedFaces} health states`);
+                
+                // Fill in any missing health states with procedural faces
+                for (let stateIndex = 0; stateIndex < healthStates.length; stateIndex++) {
+                    const baseTextureIndex = 50 + stateIndex * 3;
+                    if (!textures[baseTextureIndex]) {
+                        console.log(`Generating procedural faces for health state ${healthStates[stateIndex]}`);
+                        // Generate procedural faces for this missing state
+                        generateSingleHealthStateFaces(stateIndex, baseTextureIndex);
+                    }
+                }
+            } else {
+                console.log('No animated faces found, trying single face system...');
+                // Fallback to old single face system
+                try {
+                    await loadTexture('textures/face_100.png', 50);
+                    await loadTexture('textures/face_75.png', 53);
+                    await loadTexture('textures/face_50.png', 56);
+                    await loadTexture('textures/face_25.png', 59);
+                    await loadTexture('textures/face_dead.png', 62);
+                    console.log('Loaded single HUD face images');
+                    
+                    // Copy single faces to create "animation" frames
+                    for (let i = 0; i < 5; i++) {
+                        const baseIndex = 50 + i * 3;
+                        if (textures[baseIndex]) {
+                            textures[baseIndex + 1] = JSON.parse(JSON.stringify(textures[baseIndex]));
+                            textures[baseIndex + 2] = JSON.parse(JSON.stringify(textures[baseIndex]));
+                        }
+                    }
+                } catch (fallbackError) {
+                    console.log('Could not load any face images, using procedural faces');
+                    generateHUDFaces();
+                }
+            }
+            
+            // Try to load power-up textures (textures 70-71)
+            try {
+                await loadTexture('textures/health_pack.png', 70);
+                console.log('Loaded health_pack.png');
+            } catch (error) {
+                console.log('Could not load health_pack.png, generating procedural health pack');
+                generateHealthPackTexture();
+            }
+            
+            try {
+                await loadTexture('textures/ammo_box.png', 71);
+                console.log('Loaded ammo_box.png');
+            } catch (error) {
+                console.log('Could not load ammo_box.png, generating procedural ammo box');
+                generateAmmoBoxTexture();
+            }
+            
+            // Table sprite (texture 72)
+            try {
+                await loadTexture('textures/table.png', 72);
+                console.log('Loaded table.png');
+            } catch (e) {
+                console.log('table.png not found – generating simple wood table');
+                textures[72] = [];
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    textures[72][y] = [];
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const wood = 135 + Math.random() * 25;
+                        const dark = wood - 35;
+                        textures[72][y][x] = (y < TEXTURE_SIZE * 0.25)
+                            ? [dark, dark * 0.7, dark * 0.5, 255]
+                            : [wood, wood * 0.7, wood * 0.5, 255];
+                    }
+                }       
+            }
+            texturesLoaded = true;
+            console.log('All textures loaded!');
+        }
+        
+        // Generate procedural HUD face textures (can be replaced with user images later)
+        function generateHUDFaces() {
+            // Face texture indices: 50-64 (3 frames each for 100%, 75%, 50%, 25%, dead)
+            const faceStates = [
+                { startIndex: 50, health: 100, color: [220, 180, 140] }, // Healthy - normal skin
+                { startIndex: 53, health: 75,  color: [200, 160, 120] }, // Slightly wounded 
+                { startIndex: 56, health: 50,  color: [180, 140, 100] }, // Wounded - darker
+                { startIndex: 59, health: 25,  color: [160, 120, 80] },  // Badly wounded
+                { startIndex: 62, health: 0,   color: [120, 80, 60] }    // Dead - very dark
+            ];
+            
+            faceStates.forEach(state => {
+                // Create 3 frames for each health state
+                for (let frame = 0; frame < 3; frame++) {
+                    const textureIndex = state.startIndex + frame;
+                    textures[textureIndex] = [];
+                    
+                    for (let y = 0; y < TEXTURE_SIZE; y++) {
+                        textures[textureIndex][y] = [];
+                        for (let x = 0; x < TEXTURE_SIZE; x++) {
+                            const centerX = TEXTURE_SIZE / 2;
+                            const centerY = TEXTURE_SIZE / 2;
+                            
+                            // Create a simple face shape
+                            const faceRadius = TEXTURE_SIZE * 0.4;
+                            const distance = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
+                            
+                            if (distance < faceRadius) {
+                                // Face area - use health-based color
+                                const [r, g, b] = state.color;
+                                const noise = Math.random() * 20 - 10; // Texture variation
+                                
+                                // Add animation variation per frame
+                                const frameVariation = Math.sin(frame * Math.PI / 3) * 10;
+                                
+                                // Add some facial features
+                                let finalR = r + noise + frameVariation;
+                                let finalG = g + noise + frameVariation;
+                                let finalB = b + noise + frameVariation;
+                                
+                                // Eyes (dark spots) - slight animation
+                                const eyeOffset = Math.sin(frame * Math.PI / 2) * 1;
+                                const leftEye = Math.sqrt((x - centerX + 8 + eyeOffset) ** 2 + (y - centerY - 5) ** 2);
+                                const rightEye = Math.sqrt((x - centerX - 8 - eyeOffset) ** 2 + (y - centerY - 5) ** 2);
+                                if (leftEye < 3 || rightEye < 3) {
+                                    finalR = finalG = finalB = state.health === 0 ? 50 : 30; // Eyes
+                                }
+                                
+                                // Mouth - slight animation
+                                const mouthOffset = Math.sin(frame * Math.PI / 1.5) * 2;
+                                if (y > centerY + 5 + mouthOffset && y < centerY + 10 + mouthOffset && 
+                                    x > centerX - 6 && x < centerX + 6) {
+                                    finalR = finalG = finalB = state.health === 0 ? 40 : 20; // Mouth
+                                }
+                                
+                                // Blood/damage effects for lower health
+                                if (state.health < 75 && Math.random() < (1 - state.health / 100) * 0.3) {
+                                    finalR = Math.min(255, finalR + 100); // Add red for damage
+                                    finalG = Math.max(0, finalG - 50);
+                                    finalB = Math.max(0, finalB - 50);
+                                }
+                                
+                                textures[textureIndex][y][x] = [
+                                    Math.max(0, Math.min(255, finalR)),
+                                    Math.max(0, Math.min(255, finalG)),
+                                    Math.max(0, Math.min(255, finalB)),
+                                    255
+                                ];
+                            } else {
+                                // Transparent background
+                                textures[textureIndex][y][x] = [0, 0, 0, 0];
+                            }
+                        }
+                    }
+                }
+            });
+            
+            console.log('Generated animated HUD face textures');
+        }
+        
+        // Get the appropriate face texture based on health percentage and animation frame
+        function getFaceTextureIndex() {
+            const healthPercent = (player.health / player.maxHealth) * 100;
+            let baseIndex;
+            
+            if (healthPercent <= 0) baseIndex = 62;        // Dead (textures 62-64)
+            else if (healthPercent <= 25) baseIndex = 59;  // Badly wounded (textures 59-61)
+            else if (healthPercent <= 50) baseIndex = 56;  // Wounded (textures 56-58)
+            else if (healthPercent <= 75) baseIndex = 53;  // Slightly wounded (textures 53-55)
+            else baseIndex = 50;                           // Healthy (textures 50-52)
+            
+            // Return the current animation frame for this health state
+            return baseIndex + faceAnimation.currentFrame;
+        }
+        
+        // Update face animation
+        function updateFaceAnimation(deltaTime) {
+            faceAnimation.frameTimer += deltaTime;
+            if (faceAnimation.frameTimer >= faceAnimation.frameSpeed) {
+                faceAnimation.frameTimer = 0;
+                faceAnimation.currentFrame = (faceAnimation.currentFrame + 1) % 3; // Cycle through 0, 1, 2
+            }
+        }
+        
+        // Update power-ups (animation, respawning, collision)
+        function updatePowerUps(deltaTime) {
+            const currentTime = Date.now();
+            
+            powerUps.forEach((powerUp, index) => {
+                if (powerUp.type === 'table') return;   // décor, no pickup or bob
+                // Update bobbing animation
+                powerUp.bobTimer += deltaTime;
+                
+                
+                // Handle respawning
+                if (!powerUp.active) {
+                    if (currentTime - powerUp.pickedUpTime >= powerUp.respawnTime) {
+                        powerUp.active = true;
+                        console.log(`Power-up ${index} respawned!`);
+                    }
+                    return; // Skip inactive power-ups
+                }
+                
+                // Check collision with player
+                const dx = powerUp.x - player.x;
+                const dy = powerUp.y - player.y;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                
+                if (distance < 30) { // Player touched power-up
+                    powerUp.active = false;
+                    powerUp.pickedUpTime = currentTime;
+                    
+                    if (powerUp.type === 'health') {
+                        const healthGain = 25 + Math.floor(Math.random() * 26); // 25-50 health
+                        const oldHealth = player.health;
+                        player.health = Math.min(player.maxHealth, player.health + healthGain);
+                        const actualGain = player.health - oldHealth;
+                        console.log(`🏥 Health pack picked up! +${actualGain} health (${player.health}/${player.maxHealth})`);
+                        console.log(`🏥 Health pack picked up! ...`)
+                        playSound('pickup_health');
+                        
+                    } else if (powerUp.type === 'ammo') {
+                        const ammoGain = 10 + Math.floor(Math.random() * 11); // 10-20 ammo
+                        const oldAmmo = player.ammo;
+                        player.ammo = Math.min(player.maxAmmo, player.ammo + ammoGain);
+                        const actualGain = player.ammo - oldAmmo;
+                        console.log(`🔫 Ammo box picked up! +${actualGain} ammo (${player.ammo}/${player.maxAmmo})`);
+                        console.log(`🔫 Ammo box picked up! ...`)
+                        playSound('pickup_ammo');
+                    }
+                }
+            });
+        }
+        // Update per-frame screen-shake offsets
+function updateShake() {
+    const now = Date.now();
+    const elapsed = now - player.lastHitTime;
+    if (elapsed < shakeDuration) {
+        const amp = shakeMax * (1 - elapsed / shakeDuration);
+        screenShakeOffsetX = (Math.random() * 2 - 1) * amp;
+        screenShakeOffsetY = (Math.random() * 2 - 1) * amp;
+    } else {
+        screenShakeOffsetX = 0;
+        screenShakeOffsetY = 0;
+    }
+}
+
+// Draw full-screen overlays (damage flash & muzzle flash)
+function renderScreenEffects() {
+    const now = Date.now();
+
+    // Damage-flash overlay
+    const dmgElapsed = now - player.lastHitTime;
+    if (dmgElapsed < damageFlashDuration) {
+        const alpha = 0.6 * (1 - dmgElapsed / damageFlashDuration);
+        ctx.fillStyle = `rgba(255,0,0,${alpha})`;
+        ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    }
+}
+// Render crosshair in center of screen
+function renderCrosshair() {
+    const centerX = SCREEN_WIDTH / 2;
+    const centerY = SCREEN_HEIGHT / 2;
+    const crosshairSize = 8;
+    const crosshairThickness = 2;
+
+    ctx.fillStyle = 'white';
+    ctx.strokeStyle = 'black';
+    ctx.lineWidth = 1;
+
+    // Horizontal line
+    ctx.fillRect(centerX - crosshairSize, centerY - crosshairThickness/2, crosshairSize * 2, crosshairThickness);
+    ctx.strokeRect(centerX - crosshairSize, centerY - crosshairThickness/2, crosshairSize * 2, crosshairThickness);
+
+    // Vertical line  
+    ctx.fillRect(centerX - crosshairThickness/2, centerY - crosshairSize, crosshairThickness, crosshairSize * 2);
+    ctx.strokeRect(centerX - crosshairThickness/2, centerY - crosshairSize, crosshairThickness, crosshairSize * 2);
+}
+        
+        // Render HUD bar at bottom of screen
+        function renderHUD() {
+            const hudHeight = 80;
+            const hudY = SCREEN_HEIGHT - hudHeight;
+            
+            // Draw HUD background (blue bar like Doom/Wolfenstein)
+            const gradient = ctx.createLinearGradient(0, hudY, 0, SCREEN_HEIGHT);
+            gradient.addColorStop(0, '#4169E1'); // Royal blue top
+            gradient.addColorStop(0.5, '#1E3A8A'); // Darker blue middle
+            gradient.addColorStop(1, '#1E40AF'); // Blue bottom
+            
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, hudY, SCREEN_WIDTH, hudHeight);
+            
+            // Draw border
+            ctx.strokeStyle = '#000080';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(0, hudY, SCREEN_WIDTH, hudHeight);
+            
+            // HUD sections
+            const sectionWidth = SCREEN_WIDTH / 5;
+            
+            // Draw section dividers
+            ctx.strokeStyle = '#000080';
+            ctx.lineWidth = 1;
+            for (let i = 1; i < 5; i++) {
+                ctx.beginPath();
+                ctx.moveTo(sectionWidth * i, hudY);
+                ctx.lineTo(sectionWidth * i, SCREEN_HEIGHT);
+                ctx.stroke();
+            }
+            
+            // Text settings
+            ctx.fillStyle = 'white';
+            ctx.strokeStyle = 'black';
+            ctx.lineWidth = 1;
+            ctx.textAlign = 'center';
+            
+            // Section 1: SCORE
+            ctx.font = 'bold 16px monospace'; // Increased from 14px
+            ctx.fillText('SCORE', sectionWidth * 0.5, hudY + 18);
+            ctx.strokeText('SCORE', sectionWidth * 0.5, hudY + 18);
+            ctx.font = 'bold 22px monospace'; // Increased from 18px
+            ctx.fillText(gameStats.score.toString(), sectionWidth * 0.5, hudY + 50);
+            ctx.strokeText(gameStats.score.toString(), sectionWidth * 0.5, hudY + 50);
+            
+            // Section 2: LIVES  
+            ctx.font = 'bold 16px monospace'; // Increased from 14px
+            ctx.fillText('LIVES', sectionWidth * 1.5, hudY + 18);
+            ctx.strokeText('LIVES', sectionWidth * 1.5, hudY + 18);
+            ctx.font = 'bold 22px monospace'; // Increased from 18px
+            ctx.fillText(player.lives.toString(), sectionWidth * 1.5, hudY + 50);
+            ctx.strokeText(player.lives.toString(), sectionWidth * 1.5, hudY + 50);
+            
+            // Section 3: FACE (center)
+            const faceTextureIndex = getFaceTextureIndex();
+            const faceTexture = textures[faceTextureIndex];
+            if (faceTexture) {
+                const faceSize = 65; // Increased from 50 to 65
+                const faceX = sectionWidth * 2.5 - faceSize/2;
+                const faceY = hudY + 8; // Adjusted Y position slightly
+                
+                // Create temporary canvas for face
+                const faceCanvas = document.createElement('canvas');
+                const faceCtx = faceCanvas.getContext('2d');
+                faceCanvas.width = faceSize;
+                faceCanvas.height = faceSize;
+                
+                const faceImageData = faceCtx.createImageData(faceSize, faceSize);
+                
+                // Scale face texture to fit
+                for (let y = 0; y < faceSize; y++) {
+                    for (let x = 0; x < faceSize; x++) {
+                        const texX = Math.floor((x / faceSize) * TEXTURE_SIZE);
+                        const texY = Math.floor((y / faceSize) * TEXTURE_SIZE);
+                        
+                        if (faceTexture[texY] && faceTexture[texY][texX]) {
+                            const pixel = faceTexture[texY][texX];
+                            const index = (y * faceSize + x) * 4;
+                            faceImageData.data[index] = pixel[0];     // R
+                            faceImageData.data[index + 1] = pixel[1]; // G
+                            faceImageData.data[index + 2] = pixel[2]; // B
+                            faceImageData.data[index + 3] = pixel[3]; // A
+                        }
+                    }
+                }
+                
+                faceCtx.putImageData(faceImageData, 0, 0);
+                ctx.drawImage(faceCanvas, faceX, faceY);
+            }
+            
+            // Section 4: HEALTH
+            ctx.font = 'bold 16px monospace'; // Increased from 14px
+            ctx.fillText('HEALTH', sectionWidth * 3.5, hudY + 18);
+            ctx.strokeText('HEALTH', sectionWidth * 3.5, hudY + 18);
+            ctx.font = 'bold 22px monospace'; // Increased from 18px
+            const healthPercent = Math.round((player.health / player.maxHealth) * 100);
+            ctx.fillText(healthPercent + '%', sectionWidth * 3.5, hudY + 50);
+            ctx.strokeText(healthPercent + '%', sectionWidth * 3.5, hudY + 50);
+            
+            // Section 5: WEAPON & AMMO
+            ctx.font = 'bold 14px monospace'; // Smaller font for weapon name
+            ctx.fillText(weapons[currentWeapon].name.toUpperCase(), sectionWidth * 4.5, hudY + 16);
+            ctx.strokeText(weapons[currentWeapon].name.toUpperCase(), sectionWidth * 4.5, hudY + 16);
+            ctx.font = 'bold 12px monospace'; // Even smaller for "AMMO"
+            ctx.fillText('AMMO', sectionWidth * 4.5, hudY + 32);
+            ctx.strokeText('AMMO', sectionWidth * 4.5, hudY + 32);
+            ctx.font = 'bold 22px monospace'; // Large for ammo count
+            ctx.fillText(player.ammo.toString(), sectionWidth * 4.5, hudY + 58);
+            ctx.strokeText(player.ammo.toString(), sectionWidth * 4.5, hudY + 58);
+        }
+        
+        // Check if a position hits a wall
+        function isWall(x, y) {
+            const mapX = Math.floor(x / TILE_SIZE);
+            const mapY = Math.floor(y / TILE_SIZE);
+
+            if (mapX < 0 || mapX >= MAP_WIDTH || mapY < 0 || mapY >= MAP_HEIGHT) {
+                return true; // Out of bounds = wall
+            }
+
+            return map[mapY][mapX] > 0;
+        }
+        
+        // Returns true if any wall lies within `radius` pixels of (x,y)
+        function isWallNear(x, y, radius) {
+            return (
+                isWall(x + radius, y) ||
+                isWall(x - radius, y) ||
+                isWall(x, y + radius) ||
+                isWall(x, y - radius)
+        );
+    }          
+        
+        // Generate individual power-up textures (defined early to avoid reference errors)
+        function generateHealthPackTexture() {
+            console.log('Generating procedural health pack texture...');
+            // Health pack texture (texture 70) - red cross
+            textures[70] = [];
+            for (let y = 0; y < TEXTURE_SIZE; y++) {
+                textures[70][y] = [];
+                for (let x = 0; x < TEXTURE_SIZE; x++) {
+                    const centerX = TEXTURE_SIZE / 2;
+                    const centerY = TEXTURE_SIZE / 2;
+                    
+                    // Create red cross on white background
+                    const isVerticalBar = Math.abs(x - centerX) < 8 && Math.abs(y - centerY) < 20;
+                    const isHorizontalBar = Math.abs(y - centerY) < 8 && Math.abs(x - centerX) < 20;
+                    const isCross = isVerticalBar || isHorizontalBar;
+                    
+                    // Background circle
+                    const distance = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
+                    if (distance < TEXTURE_SIZE * 0.4) {
+                        if (isCross) {
+                            textures[70][y][x] = [220, 20, 20, 255]; // Red cross
+                        } else {
+                            textures[70][y][x] = [240, 240, 240, 255]; // White background
+                        }
+                    } else {
+                        textures[70][y][x] = [0, 0, 0, 0]; // Transparent
+                    }
+                }
+            }
+        }
+        
+        function generateAmmoBoxTexture() {
+            console.log('Generating procedural ammo box texture...');
+            // Ammo box texture (texture 71) - brown box with bullets
+            textures[71] = [];
+            for (let y = 0; y < TEXTURE_SIZE; y++) {
+                textures[71][y] = [];
+                for (let x = 0; x < TEXTURE_SIZE; x++) {
+                    const centerX = TEXTURE_SIZE / 2;
+                    const centerY = TEXTURE_SIZE / 2;
+                    
+                    // Create box shape
+                    const boxSize = TEXTURE_SIZE * 0.35;
+                    const isInBox = Math.abs(x - centerX) < boxSize && Math.abs(y - centerY) < boxSize;
+                    
+                    if (isInBox) {
+                        // Box edges
+                        const isEdge = Math.abs(x - centerX) > boxSize - 3 || Math.abs(y - centerY) > boxSize - 3;
+                        if (isEdge) {
+                            textures[71][y][x] = [80, 60, 40, 255]; // Dark brown edges
+                        } else {
+                            // Box interior with bullet pattern
+                            const bulletPattern = (Math.floor(x / 8) + Math.floor(y / 8)) % 2;
+                            if (bulletPattern === 0) {
+                                textures[71][y][x] = [160, 120, 80, 255]; // Light brown
+                            } else {
+                                textures[71][y][x] = [180, 140, 60, 255]; // Yellow (bullets)
+                            }
+                        }
+                    } else {
+                        textures[71][y][x] = [0, 0, 0, 0]; // Transparent
+                    }
+                }
+            }
+        }           
+
+        // Render power-ups (similar to sprites but simpler) - defined early
+        function renderPowerUps(imageData) {
+            // Create list of active power-ups for sorting
+            const activePowerUps = powerUps.filter(powerUp => powerUp.active);
+            if (activePowerUps.length === 0) return;
+
+            // Sort by distance (farthest first)
+            const powerUpOrder = [];
+            const powerUpDistance = [];
+
+            for (let i = 0; i < activePowerUps.length; i++) {
+                powerUpOrder[i] = i;
+                const dx = player.x - activePowerUps[i].x;
+                const dy = player.y - activePowerUps[i].y;
+                powerUpDistance[i] = dx * dx + dy * dy;
+            }
+
+            const sortedPowerUps = [];
+            for (let i = 0; i < activePowerUps.length; i++) {
+                sortedPowerUps[i] = { dist: powerUpDistance[i], order: powerUpOrder[i] };
+            }
+            sortedPowerUps.sort((a, b) => b.dist - a.dist);
+
+            // Render each power-up
+            for (let i = 0; i < activePowerUps.length; i++) {
+                const powerUp = activePowerUps[sortedPowerUps[i].order];
+
+                // Calculate bobbing offset (skip bob for static décor like tables)
+                const bobOffset = powerUp.bobSpeed > 0
+                    ? Math.sin(powerUp.bobTimer / powerUp.bobSpeed * Math.PI * 2) * powerUp.bobHeight
+                    : 0;   // no bob for static objects (e.g., tables)
+
+                // Transform to screen coordinates
+                const spriteX = powerUp.x - player.x;
+                const spriteY = powerUp.y - player.y;
+
+                const invDet = 1.0 / (player.planeX * player.dirY - player.dirX * player.planeY);
+                if (!isFinite(invDet)) continue;
+
+                const transformX = invDet * (player.dirY * spriteX - player.dirX * spriteY);
+                const transformY = invDet * (-player.planeY * spriteX + player.planeX * spriteY);
+
+                if (transformY <= 0) continue;
+
+                const spriteScreenX = Math.floor((SCREEN_WIDTH / 2) * (1 + transformX / transformY));
+
+                // Calculate size (tables full-size, others 60%)
+                const baseHeight = Math.abs(Math.floor(SCREEN_HEIGHT / Math.max(1, transformY / 32)));
+                const spriteHeight = Math.min(
+                    SCREEN_HEIGHT,
+                    baseHeight * (powerUp.type === 'table' ? 1.0 : 0.6)   // tables full‑size, others 60 %
+                );
+                const spriteWidth = spriteHeight; // Square power-ups
+
+                if (spriteHeight < 5 || spriteWidth < 5) continue;
+
+                // Apply bobbing/floor anchoring for tables
+                let drawStartY, drawEndY;
+
+                if (powerUp.type === 'table') {
+                    // Use the exact same vertical placement math as enemies
+                    const vMove       = 5000.0;
+                    const vMoveScreen = Math.floor(vMove / transformY);
+
+                    drawStartY = Math.floor(-spriteHeight / 2 + SCREEN_HEIGHT / 2 + vMoveScreen);
+                    if (drawStartY < 0) drawStartY = 0;
+
+                    drawEndY = drawStartY + spriteHeight;
+                    if (drawEndY >= SCREEN_HEIGHT) drawEndY = SCREEN_HEIGHT - 1;
+                } else {
+                    // Center‑placement for health / ammo
+                    drawStartY = Math.floor(-spriteHeight / 2 + SCREEN_HEIGHT / 2 - bobOffset);
+                    if (drawStartY < 0) drawStartY = 0;
+                    drawEndY = Math.floor(spriteHeight / 2 + SCREEN_HEIGHT / 2 - bobOffset);
+                    if (drawEndY >= SCREEN_HEIGHT) drawEndY = SCREEN_HEIGHT - 1;
+                }
+
+                let drawStartX = Math.floor(-spriteWidth / 2 + spriteScreenX);
+                if (drawStartX < 0) drawStartX = 0;
+                let drawEndX = Math.floor(spriteWidth / 2 + spriteScreenX);
+                if (drawEndX >= SCREEN_WIDTH) drawEndX = SCREEN_WIDTH - 1;
+
+                if (drawStartX >= drawEndX || drawStartY >= drawEndY) continue;
+
+                const powerUpTexture = textures[powerUp.textureIndex];
+                if (!powerUpTexture) continue;
+
+                // Render power-up
+                for (let stripe = drawStartX; stripe < drawEndX; stripe++) {
+                    const texX = Math.floor((stripe - drawStartX) * TEXTURE_SIZE / (drawEndX - drawStartX));
+
+                    if (texX < 0 || texX >= TEXTURE_SIZE) continue;
+
+                    if (transformY > 0 && stripe >= 0 && stripe < SCREEN_WIDTH &&
+                        stripe < ZBuffer.length && transformY < ZBuffer[stripe]) {
+
+                        for (let y = drawStartY; y < drawEndY; y++) {
+                            const texY = Math.floor((y - drawStartY) * TEXTURE_SIZE / (drawEndY - drawStartY));
+
+                            if (texY < 0 || texY >= TEXTURE_SIZE) continue;
+
+                            if (!powerUpTexture[texY] || !powerUpTexture[texY][texX]) continue;
+
+                            const pixel = powerUpTexture[texY][texX];
+
+                            if (!pixel || !Array.isArray(pixel)) continue;
+
+                            const alpha = pixel.length > 3 ? pixel[3] : 255;
+                            if (alpha > 128) {
+                                const brightness = Math.max(0.5, 1 - transformY / (TILE_SIZE * 6)); // Brighter than enemies
+                                const r = Math.floor(pixel[0] * brightness);
+                                const g = Math.floor(pixel[1] * brightness);
+                                const b = Math.floor(pixel[2] * brightness);
+
+                                const index = (y * SCREEN_WIDTH + stripe) * 4;
+                                if (index >= 0 && index < imageData.data.length - 3) {
+                                    imageData.data[index] = r;
+                                    imageData.data[index + 1] = g;
+                                    imageData.data[index + 2] = b;
+                                    imageData.data[index + 3] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Line of sight check between two points
+        function hasLineOfSight(x1, y1, x2, y2) {
+            const dx = x2 - x1;
+            const dy = y2 - y1;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            const steps = Math.floor(distance / 8);
+            
+            for (let i = 0; i <= steps; i++) {
+                const checkX = x1 + (dx * i / steps);
+                const checkY = y1 + (dy * i / steps);
+                
+                if (isWall(checkX, checkY)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        
+        // Create a projectile
+        function createProjectile(startX, startY, targetX, targetY, speed = 5) {
+            const dx = targetX - startX;
+            const dy = targetY - startY;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            
+            return {
+                x: startX,
+                y: startY,
+                vx: (dx / distance) * speed,
+                vy: (dy / distance) * speed,
+                lifetime: 1000,
+                color: 'yellow'
+            };
+        }
+        
+        // Update projectiles
+        function updateProjectiles(deltaTime) {
+            // Update enemy projectiles
+            for (let i = projectiles.length - 1; i >= 0; i--) {
+                const projectile = projectiles[i];
+                
+                projectile.x += projectile.vx;
+                projectile.y += projectile.vy;
+                projectile.lifetime -= deltaTime;
+                
+                if (isWall(projectile.x, projectile.y)) {
+                    projectiles.splice(i, 1);
+                    continue;
+                }
+                
+                const dx = projectile.x - player.x;
+                const dy = projectile.y - player.y;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                
+                if (distance < 20) {
+                    const currentTime = Date.now();
+                    if (currentTime - player.lastHitTime > 500) {
+                        player.health = Math.max(0, player.health - 10);
+                        player.lastHitTime = currentTime;
+                        playSound('player_hurt');
+                        
+                        // Check if player died
+                        if (player.health <= 0) {
+                            player.lives--;
+                            if (player.lives > 0) {
+                                // Respawn player
+                                player.health = player.maxHealth;
+                                player.x = 1.5 * TILE_SIZE;
+                                player.y = 1.5 * TILE_SIZE;
+                                console.log(`Player died! Lives remaining: ${player.lives}`);
+                            } else {
+                                console.log('Game Over - No lives remaining!');
+                                playSound('player_die');
+                            }
+                        }
+                    }
+                    projectiles.splice(i, 1);
+                    continue;
+                }
+                
+                if (projectile.lifetime <= 0) {
+                    projectiles.splice(i, 1);
+                }
+            }
+            
+            // Update player projectiles with DAMAGE SYSTEM
+            for (let i = playerProjectiles.length - 1; i >= 0; i--) {
+                const bullet = playerProjectiles[i];
+                
+                bullet.x += bullet.vx;
+                bullet.y += bullet.vy;
+                bullet.lifetime -= deltaTime;
+                
+                if (isWall(bullet.x, bullet.y)) {
+                    playerProjectiles.splice(i, 1);
+                    continue;
+                }
+                
+                let hitEnemy = false;
+                for (let j = 0; j < enemies.length; j++) {
+                    const enemy = enemies[j];
+                    
+                    // Only hit living enemies
+                    if (enemy.state !== 'alive') continue;
+
+                    const dx = bullet.x - enemy.x;
+                    const dy = bullet.y - enemy.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (distance < 30) { // Hit enemy
+                        const currentTime = Date.now();
+                        
+                        // Deal damage
+                        enemy.health -= bullet.damage;
+
+                        // Play “hit” only if the enemy survives this shot
+                        if (enemy.health > 0) {
+                            playEnemySound(enemy, 'hit');
+                        }
+                        enemy.hitFlashTime = currentTime; // Start hit flash effect
+                        gameStats.shotsHit++; // Track successful hits
+                        
+                        console.log(`Player hit enemy ${j} for ${bullet.damage} damage! Health: ${enemy.health}/${enemy.maxHealth}`);
+                        
+                        // Check if enemy died
+                        if (enemy.health <= 0) {
+                            enemy.state = 'dying';
+                            playEnemySound(enemy, 'die');
+                            enemy.deathStartTime = currentTime;
+                            enemy.currentFrame = 0;
+                            enemy.frameTimer = 0;
+                            enemy.isWalking = false; // Stop movement
+                            gameStats.enemiesKilled++;
+                            gameStats.score += (enemy.maxHealth === 40) ? 100 : 75; // More points for tougher enemies
+                            
+                            // Give player some ammo when enemy dies
+                            const ammoReward = Math.floor(Math.random() * 8) + 2; // 2-9 ammo
+                            player.ammo = Math.min(player.maxAmmo, player.ammo + ammoReward);
+                            
+                            console.log(`Enemy ${j} killed! Score: ${gameStats.score}, Ammo gained: ${ammoReward}`);
+                        }
+                        
+                        playerProjectiles.splice(i, 1);
+                        hitEnemy = true;
+                        break;
+                    }
+                }
+                
+                if (hitEnemy) continue;
+                
+                if (bullet.lifetime <= 0) {
+                    playerProjectiles.splice(i, 1);
+                }
+            }
+        }
+        
+        // Update enemies with DEATH SYSTEM
+        function updateEnemies(deltaTime) {
+            const currentTime = Date.now();
+            let aliveCount = 0;          // running tally of living foes this frame
+            const pad = TILE_SIZE * 0.25;   // keep ~½-tile from walls
+            
+            // Update enemies and remove dead ones
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const enemy = enemies[i];
+
+                // Track whether LOS just became true
+                const prevSee = enemy.canSeePlayer;
+                
+                // Handle death animation
+                if (enemy.state === 'dying') {
+                    enemy.frameTimer += deltaTime;
+                    if (enemy.frameTimer >= enemy.frameSpeed && enemy.currentFrame < 3) {
+                        // Only advance frames until we reach the last frame (frame 3)
+                        enemy.frameTimer = 0;
+                        enemy.currentFrame++;
+                        
+                        if (enemy.currentFrame >= 3) {
+                            // Reached last frame - stay here for 2 seconds
+                            console.log(`Enemy ${i} death animation complete, staying on last frame...`);
+                        }
+                    }
+                    
+                    // Remove enemy after death animation completes + 2 second pause on last frame
+                    const totalDeathTime = enemy.deathDuration + 2000; // Original 800ms + 2000ms pause
+                    if (currentTime - enemy.deathStartTime >= totalDeathTime) {
+                        console.log(`Removing dead enemy ${i} after ${totalDeathTime}ms`);
+                        enemies.splice(i, 1);
+                        continue; // Skip to next enemy
+                    }
+                }
+                
+                // Only do AI for living enemies
+                if (enemy.state !== 'alive') continue;
+                aliveCount++;                // count this living enemy
+                
+                const dx = player.x - enemy.x;
+                const dy = player.y - enemy.y;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                
+                enemy.canSeePlayer = hasLineOfSight(enemy.x, enemy.y, player.x, player.y);
+                // Play "spot" sound when LOS is first acquired
+                if (!prevSee && enemy.canSeePlayer) {
+                    playEnemySound(enemy, 'spot');
+                }
+                
+                const minDistance = TILE_SIZE * 1;
+                const optimalDistance = TILE_SIZE * 1.5;
+                const maxChaseDistance = TILE_SIZE * 5;
+                const shootingRange = TILE_SIZE * 4;
+                
+                const timeSinceLastShot = currentTime - enemy.lastShotTime;
+                const canShoot = enemy.canSeePlayer && 
+                               distance <= shootingRange && 
+                               timeSinceLastShot >= enemy.shootCooldown && 
+                               enemy.isWalking;
+                
+                if (!enemy.isWalking) {
+                    const shootingDuration = currentTime - enemy.shootStartTime;
+                    if (shootingDuration >= enemy.shootDuration) {
+                        enemy.isWalking = true;
+                    }
+                }
+                
+                if (canShoot) {
+                    enemy.isWalking = false;
+                    enemy.shootStartTime = currentTime;
+                    enemy.lastShotTime = currentTime;
+                    
+                    const projectile = createProjectile(enemy.x, enemy.y, player.x, player.y, 4);
+                    projectiles.push(projectile);
+                    // Play "shoot" sound for enemy
+                    playEnemySound(enemy, 'shoot');
+                    
+                    enemy.aiState = "shooting";
+                } else if (enemy.isWalking) {
+                    if (distance > optimalDistance && distance < maxChaseDistance) {
+                        enemy.aiState = "chasing";
+                        const moveX = (dx / distance) * enemy.speed * 0.7;
+                        const moveY = (dy / distance) * enemy.speed * 0.7;
+                        
+                        const newX = enemy.x + moveX;
+                        const newY = enemy.y + moveY;
+                        
+                        if (!isWallNear(newX, enemy.y, pad)) enemy.x = newX;
+                        if (!isWallNear(enemy.x, newY, pad)) enemy.y = newY;
+                    } else if (distance <= minDistance) {
+                        enemy.aiState = "retreating";
+                        const moveX = -(dx / distance) * enemy.speed * 0.4;
+                        const moveY = -(dy / distance) * enemy.speed * 0.4;
+                        
+                        const newX = enemy.x + moveX;
+                        const newY = enemy.y + moveY;
+                        
+                        if (!isWallNear(newX, enemy.y, pad)) enemy.x = newX;
+                        if (!isWallNear(enemy.x, newY, pad)) enemy.y = newY;
+                    } else {
+                        enemy.aiState = "circling";
+                        const perpX = -dy / distance;
+                        const perpY = dx / distance;
+                        
+                        const circleDirection = (i % 2 === 0) ? 1 : -1;
+                        const circleSpeed = enemy.speed * 0.6;
+                        const approachFactor = Math.sin(Date.now() * 0.001 + i) * 0.2;
+                        
+                        const moveX = (perpX * circleDirection * circleSpeed) + (dx / distance * approachFactor);
+                        const moveY = (perpY * circleDirection * circleSpeed) + (dy / distance * approachFactor);
+                        
+                        const newX = enemy.x + moveX;
+                        const newY = enemy.y + moveY;
+                        
+                        if (!isWallNear(newX, enemy.y, pad)) enemy.x = newX;
+                        if (!isWallNear(enemy.x, newY, pad)) enemy.y = newY;
+                    }
+                } else {
+                    enemy.aiState = "shooting";
+                }
+                
+                // Update animation for living enemies
+                enemy.frameTimer += deltaTime;
+                if (enemy.frameTimer >= enemy.frameSpeed) {
+                    enemy.frameTimer = 0;
+                    enemy.currentFrame = (enemy.currentFrame + 1) % 4;
+                }               
+            }
+
+            // ---- trigger the delayed victory screen ----
+            if (aliveCount === 0 && gameState === 'playing') {
+                gameState   = 'victoryPending';
+                victoryTime = Date.now();
+            }
+        }
+        
+        // Cast a single ray
+        function castRay(angle) {
+            const rayX = Math.cos(angle);
+            const rayY = Math.sin(angle);
+            
+            let distance = 0;
+            const step = 0.5;
+            
+            while (distance < 800) {
+                const testX = player.x + rayX * distance;
+                const testY = player.y + rayY * distance;
+                
+                const mapX = Math.floor(testX / TILE_SIZE);
+                const mapY = Math.floor(testY / TILE_SIZE);
+                
+                if (mapX < 0 || mapX >= MAP_WIDTH || mapY < 0 || mapY >= MAP_HEIGHT || map[mapY][mapX] > 0) {
+                    const wallType = (mapX < 0 || mapX >= MAP_WIDTH || mapY < 0 || mapY >= MAP_HEIGHT) ? 1 : map[mapY][mapX];
+                    
+                    const prevX = player.x + rayX * (distance - step);
+                    const prevY = player.y + rayY * (distance - step);
+                    const prevMapX = Math.floor(prevX / TILE_SIZE);
+                    const prevMapY = Math.floor(prevY / TILE_SIZE);
+                    
+                    let textureX;
+                    let side;
+                    
+                    if (prevMapX !== mapX) {
+                        side = 0;
+                        textureX = testY % TILE_SIZE;
+                    } else {
+                        side = 1;
+                        textureX = testX % TILE_SIZE;
+                    }
+                    
+                    textureX = Math.floor((textureX / TILE_SIZE) * TEXTURE_SIZE) % TEXTURE_SIZE;
+                    
+                    return {
+                        distance: distance,
+                        wallType: wallType - 1,
+                        textureX: textureX,
+                        side: side
+                    };
+                }
+                
+                distance += step;
+            }
+            
+            return {
+                distance: distance,
+                wallType: 0,
+                textureX: 0,
+                side: 0
+            };
+        }
+        
+        // Keep angles in –π … +π
+        function wrapAngle(a) {
+            while (a < -Math.PI) a += Math.PI * 2;
+            while (a >  Math.PI) a -= Math.PI * 2;
+            return a;
+        }
+        // Update player
+        function updatePlayer(deltaTime) {
+            // --- frame‑rate‑independent scaling ---
+            const dt       = deltaTime / 16;        // 1 ≈ 60 FPS
+            const moveStep = player.speed * dt;
+            const rotStep  = player.turnSpeed * dt;
+
+            // ---- adjust desired angle from arrow keys ----
+            if (keys['ArrowLeft'])  player.targetYaw -= rotStep;
+            if (keys['ArrowRight']) player.targetYaw += rotStep;
+
+            // ---- ease actual yaw toward target ----
+            const diff = wrapAngle(player.targetYaw - player.yaw);
+            player.yaw += diff * 0.15;          // 0.15 = smoothing factor
+            player.yaw  = wrapAngle(player.yaw);
+
+            // ---- rebuild direction & camera plane from yaw ----
+            player.dirX   = Math.cos(player.yaw);
+            player.dirY   = Math.sin(player.yaw);
+            player.planeX = -player.dirY * 0.66;
+            player.planeY =  player.dirX * 0.66;
+            
+    let newX = player.x;
+    let newY = player.y;
+    
+    if (keys['w'] || keys['W']) {
+        newX += player.dirX * moveStep;
+        newY += player.dirY * moveStep;
+    }
+    if (keys['s'] || keys['S']) {
+        newX -= player.dirX * moveStep;
+        newY -= player.dirY * moveStep;
+    }
+    if (keys['a'] || keys['A']) {
+        newX += player.dirY * moveStep;
+        newY -= player.dirX * moveStep;
+    }
+    if (keys['d'] || keys['D']) {
+        newX -= player.dirY * moveStep;
+        newY += player.dirX * moveStep;
+    }
+                
+            // ── weapon-bob timer ──
+            const moving = (newX !== player.x || newY !== player.y);
+            if (moving) {
+                player.walkTimer += deltaTime;
+            } else {
+                player.walkTimer = 0;
+            }
+            if (!isWall(newX, player.y)) player.x = newX;
+            if (!isWall(player.x, newY)) player.y = newY;
+        }
+        
+        // Render sky and floor (grass outside, wood inside)
+function renderFloorAndCeiling(imageData) {
+    const data = imageData.data;
+
+    /* ---------- SKY (top half) ---------- */
+    for (let y = 0; y < SCREEN_HEIGHT >> 1; y++) {
+        const brightness = 0.8 + (y / SCREEN_HEIGHT) * 0.4;
+        const r = Math.floor(135 * brightness);
+        const g = Math.floor(180 * brightness);
+        const b = Math.floor(235 * brightness);
+
+        for (let x = 0; x < SCREEN_WIDTH; x++) {
+            const idx = (y * SCREEN_WIDTH + x) * 4;
+            data[idx]     = r;
+            data[idx + 1] = g;
+            data[idx + 2] = b;
+            data[idx + 3] = 255;
+        }
+    }
+
+    /* ---------- FLOOR (bottom half) ---------- */
+    // Classic floor-casting: two colours
+    //   tile 0  → floorPalette[0]  (grass)
+    //   tile >0 → floorPalette[1]  (wood)
+
+    const rayDirX0 = player.dirX - player.planeX;
+    const rayDirY0 = player.dirY - player.planeY;
+    const rayDirX1 = player.dirX + player.planeX;
+    const rayDirY1 = player.dirY + player.planeY;
+
+    for (let y = SCREEN_HEIGHT >> 1; y < SCREEN_HEIGHT; y++) {
+        const p       = y - (SCREEN_HEIGHT / 2);
+        const posZ    = 0.5 * SCREEN_HEIGHT;
+        const rowDist = posZ / p;
+
+        const stepX = rowDist * (rayDirX1 - rayDirX0) / SCREEN_WIDTH;
+        const stepY = rowDist * (rayDirY1 - rayDirY0) / SCREEN_WIDTH;
+
+        let floorX = (player.x / TILE_SIZE) + rowDist * rayDirX0;
+        let floorY = (player.y / TILE_SIZE) + rowDist * rayDirY0;
+
+        for (let x = 0; x < SCREEN_WIDTH; x++) {
+            // Nudge 1/100 tile inward so edge pixels don’t spill into the neighbour tile
+            const cellX = (floorX - 0.01) | 0;
+            const cellY = (floorY - 0.01) | 0;
+
+            // Decide floor colour
+            //   0 = grass (outdoors)
+            //   1 = wood  (interior rooms)
+            //   2 = yellow walkway (your “x” strip)
+            let paletteIdx = 0;
+
+            if (cellY >= 0 && cellY < MAP_HEIGHT && cellX >= 0 && cellX < MAP_WIDTH) {
+                const tile = map[cellY][cellX];
+
+                if (tile === 0) {
+                   // --- Walkway strip (columns 10-14, rows 4-14) ---
+                if (cellX >= 10 && cellX <= 14 && cellY >= 4 && cellY <= 14) {
+                     paletteIdx = 2;          // yellow walkway
+                } else {
+                    
+                        // Interior heuristic: wood if completely surrounded by walls, else grass
+                        const n = (map[cellY - 1]?.[cellX] || 0) > 0;
+                        const s = (map[cellY + 1]?.[cellX] || 0) > 0;
+                        const w = (map[cellY]?.[cellX - 1] || 0) > 0;
+                        const e = (map[cellY]?.[cellX + 1] || 0) > 0;
+                        paletteIdx = (n && s && w && e) ? 1 : 0;
+                    }
+                } // <-- INSERTED MISSING CLOSING BRACE
+            }
+
+            const [r, g, b] = floorPalette[paletteIdx];
+
+            const idx = (y * SCREEN_WIDTH + x) * 4;
+            data[idx]     = r;
+            data[idx + 1] = g;
+            data[idx + 2] = b;
+            data[idx + 3] = 255;
+
+            floorX += stepX;
+            floorY += stepY;
+        }
+    }
+}
+        
+        // Render sprites with DEATH ANIMATION and HIT FLASH
+        function renderSprites(imageData) {
+            const spriteOrder = [];
+            const spriteDistance = [];
+            
+            for (let i = 0; i < enemies.length; i++) {
+                spriteOrder[i] = i;
+                const dx = player.x - enemies[i].x;
+                const dy = player.y - enemies[i].y;
+                spriteDistance[i] = dx * dx + dy * dy;
+            }
+            
+            const sprites = [];
+            for (let i = 0; i < enemies.length; i++) {
+                sprites[i] = { dist: spriteDistance[i], order: spriteOrder[i] };
+            }
+            sprites.sort((a, b) => b.dist - a.dist);
+            
+            for (let i = 0; i < enemies.length; i++) {
+                const enemy = enemies[sprites[i].order];
+                
+                const spriteX = enemy.x - player.x;
+                const spriteY = enemy.y - player.y;
+                
+                const invDet = 1.0 / (player.planeX * player.dirY - player.dirX * player.planeY);
+                
+                if (!isFinite(invDet)) continue;
+                
+                const transformX = invDet * (player.dirY * spriteX - player.dirX * spriteY);
+                const transformY = invDet * (-player.planeY * spriteX + player.planeX * spriteY);
+                
+                if (transformY <= 0) continue;
+                
+                const spriteScreenX = Math.floor((SCREEN_WIDTH / 2) * (1 + transformX / transformY));
+                
+                const uDiv = 1;
+                const vDiv = 1; 
+                const vMove = 5000.0;
+                const vMoveScreen = Math.floor(vMove / transformY);
+                
+                const baseHeight = Math.abs(Math.floor(SCREEN_HEIGHT / Math.max(1, transformY / 32)));
+                const spriteHeight = Math.min(SCREEN_HEIGHT, baseHeight / vDiv * spriteScaleFactor);
+                const spriteWidth = Math.min(SCREEN_WIDTH, baseHeight / uDiv * spriteScaleFactor);
+                
+                if (spriteHeight < 5 || spriteWidth < 5) continue;
+                
+                let drawStartY = Math.floor(-spriteHeight / 2 + SCREEN_HEIGHT / 2 + vMoveScreen);
+                if (drawStartY < 0) drawStartY = 0;
+                let drawEndY = Math.floor(spriteHeight / 2 + SCREEN_HEIGHT / 2 + vMoveScreen);
+                if (drawEndY >= SCREEN_HEIGHT) drawEndY = SCREEN_HEIGHT - 1;
+                
+                let drawStartX = Math.floor(-spriteWidth / 2 + spriteScreenX);
+                if (drawStartX < 0) drawStartX = 0;
+                let drawEndX = Math.floor(spriteWidth / 2 + spriteScreenX);
+                if (drawEndX >= SCREEN_WIDTH) drawEndX = SCREEN_WIDTH - 1;
+                
+                if (drawStartX >= drawEndX || drawStartY >= drawEndY) continue;
+                
+                // Choose texture based on enemy state
+                let currentTextureIndex;
+                if (enemy.state === 'dying') {
+                    currentTextureIndex = enemy.deathTextureIndex + enemy.currentFrame;
+                } else if (enemy.isWalking) {
+                    currentTextureIndex = enemy.walkTextureIndex + enemy.currentFrame;
+                } else {
+                    currentTextureIndex = enemy.shootTextureIndex + enemy.currentFrame;
+                }
+                
+                const enemyTexture = textures[currentTextureIndex];
+                
+                if (!enemyTexture) continue;
+                
+                // Check if enemy should flash red (hit effect)
+                const currentTime = Date.now();
+                const isHitFlashing = (currentTime - enemy.hitFlashTime < enemy.hitFlashDuration);
+                
+                for (let stripe = drawStartX; stripe < drawEndX; stripe++) {
+                    const texX = Math.floor((stripe - drawStartX) * TEXTURE_SIZE / (drawEndX - drawStartX));
+                    
+                    if (texX < 0 || texX >= TEXTURE_SIZE) continue;
+                    
+                    if (transformY > 0 && stripe >= 0 && stripe < SCREEN_WIDTH && 
+                        stripe < ZBuffer.length && transformY < ZBuffer[stripe]) {
+                        
+                        for (let y = drawStartY; y < drawEndY; y++) {
+                            const d = (y - vMoveScreen) * 256 - SCREEN_HEIGHT * 128 + spriteHeight * 128;
+                            const texY = Math.floor(((d * TEXTURE_SIZE) / spriteHeight) / 256);
+                            
+                            if (texY < 0 || texY >= TEXTURE_SIZE) continue;
+                            
+                            if (!enemyTexture[texY] || !enemyTexture[texY][texX]) continue;
+                            
+                            const pixel = enemyTexture[texY][texX];
+                            
+                            if (!pixel || !Array.isArray(pixel)) continue;
+                            
+                            const alpha = pixel.length > 3 ? pixel[3] : 255;
+                            if (alpha > 128) {
+                                const brightness = Math.max(0.4, 1 - transformY / (TILE_SIZE * 8));
+                                let r = Math.floor(pixel[0] * brightness);
+                                let g = Math.floor(pixel[1] * brightness);
+                                let b = Math.floor(pixel[2] * brightness);
+                                
+                                // Apply hit flash effect (red tint)
+                                if (isHitFlashing && enemy.state === 'alive') {
+                                    r = Math.min(255, r + 100); // Add red
+                                    g = Math.max(0, g - 50);     // Reduce green
+                                    b = Math.max(0, b - 50);     // Reduce blue
+                                }
+                                
+                                const index = (y * SCREEN_WIDTH + stripe) * 4;
+                                if (index >= 0 && index < imageData.data.length - 3) {
+                                    imageData.data[index] = r;
+                                    imageData.data[index + 1] = g;
+                                    imageData.data[index + 2] = b;
+                                    imageData.data[index + 3] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Render weapon at bottom of screen
+        function renderWeapon(imageData) {
+            const weapon = weapons[currentWeapon];
+            if (!weapon.isVisible) return;
+            
+            let weaponTexture;
+            if (weapon.state === 'coming_up') {
+                weaponTexture = textures[weapon.upTextures[weapon.currentFrame]];
+            } else if (weapon.state === 'firing') {
+                weaponTexture = textures[weapon.fireTextures[weapon.currentFrame]];
+            } else if (weapon.state === 'ready') {
+                weaponTexture = textures[weapon.upTextures[weapon.upTextures.length - 1]];
+            }
+            
+            if (!weaponTexture) return;
+            
+            const weaponWidth = 150;
+            const weaponHeight = 120;
+            const hudHeight = 80;
+            
+            // ── Weapon bob & placement ──
+                const freq = 0.006;          // bob frequency
+                const amp  = 6;              // bob amplitude in px
+                const bob  = Math.sin(player.walkTimer * freq) * amp;
+
+                const floorY = SCREEN_HEIGHT - HUD_HEIGHT;   // top edge of HUD
+                const baseY  = floorY - weaponHeight + 8;    // 8-px gap
+
+                const weaponX = SCREEN_WIDTH / 2 - weaponWidth / 2 + bob;  // gentle X sway
+                const weaponY = baseY - bob * 0.5;                         // gentle Y bob
+                
+                // Round once so indices stay integers
+                const weaponIX = Math.round(weaponX);
+                const weaponIY = Math.round(weaponY);
+                for (let y = 0; y < weaponHeight; y++) {
+                for (let x = 0; x < weaponWidth; x++) {
+                    const screenY = weaponIY + y;
+                    const screenX = weaponIX + x;
+                    
+                    // Only render if within screen bounds and above HUD
+                    if (screenX >= 0 && screenX < SCREEN_WIDTH && 
+                        screenY >= 0 && screenY < SCREEN_HEIGHT) {
+                        
+                        const texX = Math.floor((x / weaponWidth) * TEXTURE_SIZE);
+                        const texY = Math.floor((y / weaponHeight) * TEXTURE_SIZE);
+                        
+                        if (texX >= 0 && texX < TEXTURE_SIZE && texY >= 0 && texY < TEXTURE_SIZE && 
+                            weaponTexture[texY] && weaponTexture[texY][texX]) {
+                            
+                            const pixel = weaponTexture[texY][texX];
+                            if (pixel && pixel[3] > 128) { // Check alpha
+                                const index = (screenY * SCREEN_WIDTH + screenX) * 4;
+                                if (index >= 0 && index < imageData.data.length - 3) {
+                                    imageData.data[index] = pixel[0];
+                                    imageData.data[index + 1] = pixel[1];
+                                    imageData.data[index + 2] = pixel[2];
+                                    imageData.data[index + 3] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Render the 3D view
+        function render() {
+            try {
+                if (!texturesLoaded) {
+                    ctx.fillStyle = 'white';
+                    ctx.font = '20px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('Loading textures...', SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+                    console.log('Waiting for textures to load...');
+                    return;
+                }
+                
+                const imageData = ctx.createImageData(SCREEN_WIDTH, SCREEN_HEIGHT);
+                
+                renderFloorAndCeiling(imageData);
+                
+                const numRays = SCREEN_WIDTH;
+                
+                for (let i = 0; i < numRays; i++) {
+                    const cameraX = 2 * i / SCREEN_WIDTH - 1;
+                    const rayDirX = player.dirX + player.planeX * cameraX;
+                    const rayDirY = player.dirY + player.planeY * cameraX;
+                    
+                    const rayAngle = Math.atan2(rayDirY, rayDirX);
+                    const hit = castRay(rayAngle);
+                    
+                    const correctedDistance = hit.distance * Math.cos(rayAngle - Math.atan2(player.dirY, player.dirX));
+                    
+                    ZBuffer[i] = correctedDistance;
+                    
+                    const wallHeight = (TILE_SIZE * SCREEN_HEIGHT) / correctedDistance;
+                    
+                    const drawStart = (SCREEN_HEIGHT - wallHeight) / 2;
+                    const drawEnd = drawStart + wallHeight;
+                    
+                    const texture = textures[hit.wallType % textures.length];
+                    if (!texture) continue;
+                    
+                    const textureYStep = TEXTURE_SIZE / wallHeight;
+                    let textureY = (drawStart < 0) ? -drawStart * textureYStep : 0;
+                    
+                    const startY = Math.max(0, Math.floor(drawStart));
+                    const endY = Math.min(SCREEN_HEIGHT - 1, Math.floor(drawEnd));
+                    
+                    for (let y = startY; y < endY; y++) {
+                        const texY = Math.floor(textureY) % TEXTURE_SIZE;
+                        const pixel = texture[texY][hit.textureX];
+                        
+                        let brightness = Math.max(0.3, 1 - correctedDistance / 400);
+                        
+                        if (hit.side === 1) {
+                            brightness *= 0.7;
+                        }
+                        
+                        const r = Math.floor(pixel[0] * brightness);
+                        const g = Math.floor(pixel[1] * brightness);
+                        const b = Math.floor(pixel[2] * brightness);
+                        
+                        const index = (y * SCREEN_WIDTH + i) * 4;
+                        if (index >= 0 && index < imageData.data.length - 3) {
+                            imageData.data[index] = r;
+                            imageData.data[index + 1] = g;
+                            imageData.data[index + 2] = b;
+                            imageData.data[index + 3] = 255;
+                        }
+                        
+                        textureY += textureYStep;
+                    }
+                }
+                
+                renderSprites(imageData);
+                renderPowerUps(imageData);  // Render power-ups after sprites
+                renderWeapon(imageData);
+                
+              // Shake the world & overlays, but keep the HUD steady
+            ctx.save();
+
+            // 1) Draw the world (imageData) shifted by the shake offsets.
+            ctx.putImageData(
+                imageData,
+            Math.round(screenShakeOffsetX),   // X offset
+            Math.round(screenShakeOffsetY)    // Y offset
+);
+
+            // 2) Draw screen-space overlays (red flash + crosshair) with the same offset.
+            ctx.translate(screenShakeOffsetX, screenShakeOffsetY);
+            renderScreenEffects();
+            renderCrosshair();
+
+            ctx.restore();      // Reset transform so the HUD doesn’t move
+
+            renderHUD();        // HUD draws after shake and stays anchored
+                
+                // Debug info (moved to top left to avoid HUD)
+                ctx.fillStyle = 'white';
+                ctx.font = '12px monospace';
+                ctx.textAlign = 'left';
+                ctx.fillText(`FPS: ${Math.round(fps)}`, 10, 20);
+                ctx.fillText(`Enemies Alive: ${enemies.filter(e => e.state === 'alive').length}`, 10, 35);
+                ctx.fillText(`Weapon: ${weapons[currentWeapon].name} - ${weapons[currentWeapon].state}`, 10, 50);
+                ctx.fillText(`Face Frame: ${faceAnimation.currentFrame + 1}/3`, 10, 65);
+               ctx.fillText(`Power-ups: ${powerUps.filter(p => p.active).length}/${powerUps.length} active`, 10, 80);
+
+               // --------------------------- VICTORY ---------------------------
+               if (gameState === 'victory') {
+                // translucent veil
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+                ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT - HUD_HEIGHT);
+
+                // Victory text
+                ctx.fillStyle = 'lime';
+                ctx.font = 'bold 48px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('🎉  VICTORY!  🎉', SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 60);
+
+                ctx.fillStyle = '#fff';
+                ctx.font = '20px monospace';
+                ctx.fillText(`Enemies Killed: ${gameStats.enemiesKilled}`, SCREEN_WIDTH/2, SCREEN_HEIGHT/2 - 20);
+
+                // Replay button
+                canvas.style.cursor = 'pointer';   // show a hand cursor on overlay
+                const btnX = SCREEN_WIDTH / 2 - REPLAY_BTN.w / 2;
+                const btnY = SCREEN_HEIGHT / 2 + 20;
+
+                ctx.fillStyle = '#1E40AF';
+                ctx.fillRect(btnX, btnY, REPLAY_BTN.w, REPLAY_BTN.h);
+                ctx.strokeStyle = '#000';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(btnX, btnY, REPLAY_BTN.w, REPLAY_BTN.h);
+
+                ctx.fillStyle = '#fff';
+                ctx.font = 'bold 28px monospace';
+                ctx.fillText('Replay', SCREEN_WIDTH / 2, btnY + REPLAY_BTN.h / 2 + 10);
+            }
+               // ----------------------------------------------------------------
+
+               // Game over condition
+               if (player.health <= 0 && player.lives <= 0) {
+                   ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+                   ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT - 80); // Don't cover HUD
+
+                   ctx.fillStyle = 'red';
+                   ctx.font = 'bold 32px monospace';
+                   ctx.textAlign = 'center';
+                   ctx.fillText('💀 GAME OVER 💀', SCREEN_WIDTH/2, SCREEN_HEIGHT/2 - 40);
+                   ctx.fillText(`Final Score: ${gameStats.score}`, SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+
+                   ctx.fillStyle = 'white';
+                   ctx.font = '18px monospace';
+                   ctx.fillText(`Enemies Killed: ${gameStats.enemiesKilled}`, SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 30);
+               }
+            } catch (error) {
+                console.error('Error in render function:', error);
+                // Draw error message
+                ctx.fillStyle = 'red';
+                ctx.font = '20px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('Render Error - Check Console', SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+            }
+        }
+        
+        // Game loop
+        let lastTime = 0;
+        let fps = 0;
+        
+
+        function gameLoop(currentTime) {
+            try {
+                let deltaTime = 16;
+                if (lastTime !== 0) {
+                    deltaTime = currentTime - lastTime;
+                    fps = 1000 / deltaTime;
+                }
+                lastTime = currentTime;
+                
+                updatePlayer(deltaTime);
+                updateEnemies(deltaTime);
+                updateProjectiles(deltaTime);
+                updateShake();        // <-- keep the shake timer running
+                updateWeapon(deltaTime);
+                handleAutoFire();      // continuous fire if Space held
+                updateFaceAnimation(deltaTime);
+                updatePowerUps(deltaTime);  // Add power-up updates
+                render();
+                // ---- handle victory delay ----
+                if (gameState === 'victoryPending' && Date.now() - victoryTime >= VICTORY_DELAY_MS) {
+                    gameState = 'victory';
+                }
+                requestAnimationFrame(gameLoop);
+            } catch (error) {
+                console.error('Error in game loop:', error);
+                // Try to continue the game loop despite errors
+                requestAnimationFrame(gameLoop);
+            }
+        }
+        
+        // Initialize and start
+        async function initGame() {
+            console.log('Starting game initialization...');
+            
+            // Show immediate loading message
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+            ctx.fillStyle = 'white';
+            ctx.font = '24px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('Initializing Game...', SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+            
+            try {
+                await generateTextures();
+                console.log('Textures loaded successfully, starting game loop...');
+                loadSounds();   // preload audio
+                requestAnimationFrame(gameLoop);
+            } catch (error) {
+                console.error('Error during initialization:', error);
+                // Try to start anyway with whatever textures we have
+                console.log('Attempting to start with partial textures...');
+                texturesLoaded = true;
+                requestAnimationFrame(gameLoop);
+            }
+        }
+        
+        // Start the game immediately
+        console.log('Page loaded, starting initialization...');
+        initGame();
+
+        // ----------- ENEMY SPAWN SECTION: tag each enemy with enemyType -----------
+        // (Find where enemies.push is called and add enemyType: 'e1' or 'e2')
+        // Example:
+        // enemies.push({
+        //     ...,
+        //     enemyType: 'e1',
+        // });
+    </script>
+</body>
+</html>

@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Modular Raycaster</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #222;
+            color: white;
+            font-family: monospace;
+        }
+        canvas {
+            border: 2px solid #555;
+            background: #000;
+            width: 1280px;
+            height: 960px;
+            image-rendering: pixelated;
+        }
+        .controls {
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h2>Modular Raycaster - Testing Module Integration</h2>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div class="controls">
+        <strong>Status:</strong> <span id="status">Loading modules...</span><br>
+        <strong>Controls:</strong> WASD to move, Arrow keys to turn<br>
+        <strong>Weapons:</strong> 1 = Pistol, 2 = Shotgun, R to draw weapon or reload, Spacebar/Mouse Click to fire<br>
+    </div>
+
+    <script type="module">
+        // Import modules
+        import { 
+            textures, 
+            sounds, 
+            texturesLoaded, 
+            loadAllAssets, 
+            playSound, 
+            playEnemySound, 
+            getEnemyVolume 
+        } from './assets.js';
+        
+        import { 
+            MAP_WIDTH, 
+            MAP_HEIGHT, 
+            TILE_SIZE, 
+            map, 
+            floorPalette, 
+            isWall, 
+            isWallNear, 
+            getWallTexture, 
+            hasLineOfSight, 
+            getDistance
+        } from './map.js';
+
+        // Update status
+        document.getElementById('status').textContent = 'Modules imported, loading assets...';
+
+        // Initialize canvas
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        const SCREEN_WIDTH = 640;
+        const SCREEN_HEIGHT = 480;
+        const HUD_HEIGHT = 80;
+        const TEXTURE_SIZE = 64;
+
+        // Test basic functionality
+        console.log('Testing modules:');
+        console.log('MAP_WIDTH:', MAP_WIDTH);
+        console.log('MAP_HEIGHT:', MAP_HEIGHT);
+        console.log('TILE_SIZE:', TILE_SIZE);
+        console.log('Map loaded:', map.length, 'rows');
+        console.log('isWall(0, 0):', isWall(0, 0));
+        console.log('isWall(64, 64):', isWall(64, 64));
+
+        // Simple player object for testing
+        const player = {
+            x: 1.5 * TILE_SIZE,
+            y: 1.5 * TILE_SIZE,
+            dirX: 1, dirY: 0,
+            planeX: 0, planeY: 0.66,
+            health: 100, maxHealth: 100,
+            ammo: 50, maxAmmo: 200,
+            lives: 3
+        };
+
+        // Test asset loading
+        async function initGame() {
+            try {
+                document.getElementById('status').textContent = 'Loading assets...';
+                await loadAllAssets();
+                
+                document.getElementById('status').textContent = 'Assets loaded! Game ready.';
+                console.log('Assets loaded successfully!');
+                console.log('Textures array length:', textures.length);
+                console.log('Sounds loaded:', Object.keys(sounds).length);
+                
+                // Test sound
+                setTimeout(() => {
+                    console.log('Testing sound...');
+                    playSound('pistol_fire');
+                }, 1000);
+                
+                // Draw a simple test screen
+                ctx.fillStyle = '#001100';
+                ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+                
+                ctx.fillStyle = 'white';
+                ctx.font = '20px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('Modules loaded successfully!', SCREEN_WIDTH/2, SCREEN_HEIGHT/2 - 40);
+                ctx.fillText(`Map: ${MAP_WIDTH}x${MAP_HEIGHT}`, SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+                ctx.fillText(`Textures: ${textures.length}`, SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 40);
+                ctx.fillText(`Sounds: ${Object.keys(sounds).length}`, SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 80);
+                
+            } catch (error) {
+                document.getElementById('status').textContent = 'Error loading assets: ' + error;
+                console.error('Error loading assets:', error);
+                
+                // Draw error screen
+                ctx.fillStyle = '#220000';
+                ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+                ctx.fillStyle = 'red';
+                ctx.font = '20px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('Error loading modules', SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+                ctx.fillText(error.message, SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 40);
+            }
+        }
+
+        // Start initialization
+        initGame();
+        
+    </script>
+</body>
+</html>

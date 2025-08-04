@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Simple Module Test</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #222;
+            color: white;
+            font-family: monospace;
+        }
+        canvas {
+            border: 2px solid #555;
+            background: #000;
+            width: 640px;
+            height: 480px;
+            image-rendering: pixelated;
+        }
+    </style>
+</head>
+<body>
+    <h2>Simple Module Test</h2>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div id="status">Loading...</div>
+
+    <script type="module">
+        try {
+            console.log('Starting simple test...');
+            
+            // Test basic imports
+            const { loadAllAssets, textures, sounds } = await import('./assets.js');
+            console.log('Assets module loaded');
+            
+            const { MAP_WIDTH, MAP_HEIGHT, isWall } = await import('./map.js');
+            console.log('Map module loaded, MAP_WIDTH:', MAP_WIDTH);
+            
+            document.getElementById('status').innerHTML = `
+                ✅ Modules loaded successfully!<br>
+                Map size: ${MAP_WIDTH}x${MAP_HEIGHT}<br>
+                Wall check at (0,0): ${isWall(0, 0)}<br>
+                Textures array: ${textures.length} items<br>
+                Sounds object: ${Object.keys(sounds).length} keys
+            `;
+            
+            // Draw something simple
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            
+            ctx.fillStyle = '#004400';
+            ctx.fillRect(0, 0, 640, 480);
+            
+            ctx.fillStyle = 'white';
+            ctx.font = '24px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('Modules loaded successfully!', 320, 240);
+            
+            console.log('✅ Simple test completed successfully');
+            
+        } catch (error) {
+            console.error('❌ Error in simple test:', error);
+            document.getElementById('status').innerHTML = `❌ Error: ${error.message}`;
+            
+            // Draw error on canvas
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            
+            ctx.fillStyle = '#440000';
+            ctx.fillRect(0, 0, 640, 480);
+            
+            ctx.fillStyle = 'white';
+            ctx.font = '20px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('Module Error', 320, 200);
+            ctx.fillText(error.message, 320, 240);
+        }
+    </script>
+</body>
+</html>

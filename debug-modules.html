@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Debug Modules</title>
+</head>
+<body>
+    <h2>Module Import Debug</h2>
+    <div id="output"></div>
+    
+    <script type="module">
+        const output = document.getElementById('output');
+        
+        try {
+            output.innerHTML += 'Testing module imports...<br>';
+            
+            // Test each module individually
+            import('./assets.js').then(assets => {
+                output.innerHTML += '✅ assets.js loaded<br>';
+                return import('./map.js');
+            }).then(map => {
+                output.innerHTML += '✅ map.js loaded<br>';
+                return import('./render.js');
+            }).then(render => {
+                output.innerHTML += '✅ render.js loaded<br>';
+                return import('./weapons.js');
+            }).then(weapons => {
+                output.innerHTML += '✅ weapons.js loaded<br>';
+                return import('./ai.js');
+            }).then(ai => {
+                output.innerHTML += '✅ ai.js loaded<br>';
+                return import('./hud.js');
+            }).then(hud => {
+                output.innerHTML += '✅ hud.js loaded<br>';
+                return import('./core.js');
+            }).then(core => {
+                output.innerHTML += '✅ core.js loaded<br>';
+                output.innerHTML += '<br><strong>All modules loaded successfully!</strong><br>';
+            }).catch(error => {
+                output.innerHTML += `❌ Error loading modules: ${error}<br>`;
+                console.error('Module loading error:', error);
+            });
+            
+        } catch (error) {
+            output.innerHTML += `❌ Script error: ${error}<br>`;
+            console.error('Script error:', error);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Complete Modular Raycaster</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #222;
+            color: white;
+            font-family: monospace;
+        }
+        canvas {
+            border: 2px solid #555;
+            background: #000;
+            width: 1280px;
+            height: 960px;
+            image-rendering: pixelated;
+            cursor: crosshair;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    
+
+    <script type="module">
+        // Import the core game module
+        import { initGame, getGameState } from './core.js';
+
+        // Get canvas element
+        const canvas = document.getElementById('canvas');
+
+        // Initialize the complete game
+        async function startGame() {
+            try {
+                const success = await initGame(canvas);
+                
+                if (success) {
+                    console.log('🎉 Complete modular raycaster loaded successfully!');
+                    console.log('📦 Modules: assets.js, map.js, render.js, weapons.js, ai.js, hud.js, core.js');
+                    console.log('🎮 Ready to play!');
+                } else {
+                    console.error('❌ Failed to initialize game');
+                }
+                
+            } catch (error) {
+                console.error('Failed to start game:', error);
+            }
+        }
+
+
+        // Start the game
+        startGame();
+        
+    </script>
+</body>
+</html>

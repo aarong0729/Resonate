@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Weapons Module Test</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #222;
+            color: white;
+            font-family: monospace;
+        }
+        canvas {
+            border: 2px solid #555;
+            background: #000;
+            width: 1280px;
+            height: 960px;
+            image-rendering: pixelated;
+        }
+        .controls {
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h2>Weapons Module Test - Complete Raycasting with Weapons</h2>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div class="controls">
+        <strong>Status:</strong> <span id="status">Loading modules...</span><br>
+        <strong>Controls:</strong> WASD to move, Arrow keys to turn<br>
+        <strong>Weapons:</strong> 1=Pistol, 2=Shotgun, R=Draw/Reload, Space=Fire<br>
+        <strong>Test:</strong> Full weapon system with projectiles and switching<br>
+    </div>
+
+    <script type="module">
+        // Import modules
+        import { 
+            textures, 
+            sounds, 
+            loadAllAssets, 
+            playSound
+        } from './assets.js';
+        
+        import { 
+            MAP_WIDTH, 
+            MAP_HEIGHT, 
+            TILE_SIZE, 
+            map, 
+            isWall
+        } from './map.js';
+        
+        import {
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+            HUD_HEIGHT,
+            initRenderer,
+            render
+        } from './render.js';
+        
+        import {
+            weapons,
+            currentWeapon,
+            switchWeapon,
+            drawWeapon,
+            shootPlayer,
+            updateWeapon,
+            handleAutoFire,
+            updateProjectiles,
+            getCurrentWeapon,
+            getWeaponStats,
+            getProjectiles,
+            getGameStats
+        } from './weapons.js';
+
+        // Update status
+        document.getElementById('status').textContent = 'Modules imported, loading assets...';
+
+        // Initialize canvas
+        const canvas = document.getElementById('canvas');
+        const ctx = initRenderer(canvas);
+
+        // Game objects
+        const player = {
+            x: 1.5 * TILE_SIZE,
+            y: 1.5 * TILE_SIZE,
+            dirX: 1, dirY: 0,
+            planeX: 0, planeY: 0.66,
+            health: 100, maxHealth: 100,
+            ammo: 50, maxAmmo: 200,
+            lives: 3,
+            walkTimer: 0
+        };
+
+        // Test enemies for projectile testing
+        const enemies = [
+            { 
+                x: 5 * TILE_SIZE, 
+                y: 5 * TILE_SIZE, 
+                health: 50, 
+                maxHealth: 50,
+                state: 'alive',
+                enemyType: 'e1'
+            }
+        ];
+
+        // Test sprites (including enemies)
+        const sprites = [
+            { x: 5 * TILE_SIZE, y: 5 * TILE_SIZE, textureIndex: 8, active: true },  // Enemy sprite
+            { x: 10 * TILE_SIZE, y: 10 * TILE_SIZE, textureIndex: 68, active: true }, // Health pack
+            { x: 12 * TILE_SIZE, y: 8 * TILE_SIZE, textureIndex: 69, active: true }   // Ammo box
+        ];
+
+        // Input handling
+        const keys = {};
+        window.addEventListener('keydown', (e) => {
+            keys[e.key] = true;
+            
+            // Weapon switching
+            if (e.key === '1') {
+                switchWeapon(0); // Switch to pistol
+            }
+            if (e.key === '2') {
+                switchWeapon(1); // Switch to shotgun
+            }
+            
+            // Draw weapon / reload
+            if (e.key === 'r' || e.key === 'R') {
+                drawWeapon(player);
+            }
+            
+            // Manual shooting (for testing)
+            if (e.key === ' ') {
+                shootPlayer(player);
+            }
+        });
+        
+        window.addEventListener('keyup', (e) => {
+            keys[e.key] = false;
+        });
+
+        // Update player movement
+        function updatePlayer(deltaTime) {
+            const moveSpeed = 0.003 * deltaTime;
+            const rotSpeed = 0.002 * deltaTime;
+            
+            // Rotation
+            if (keys['ArrowLeft']) {
+                const oldDirX = player.dirX;
+                player.dirX = player.dirX * Math.cos(rotSpeed) - player.dirY * Math.sin(rotSpeed);
+                player.dirY = oldDirX * Math.sin(rotSpeed) + player.dirY * Math.cos(rotSpeed);
+                const oldPlaneX = player.planeX;
+                player.planeX = player.planeX * Math.cos(rotSpeed) - player.planeY * Math.sin(rotSpeed);
+                player.planeY = oldPlaneX * Math.sin(rotSpeed) + player.planeY * Math.cos(rotSpeed);
+            }
+            if (keys['ArrowRight']) {
+                const oldDirX = player.dirX;
+                player.dirX = player.dirX * Math.cos(-rotSpeed) - player.dirY * Math.sin(-rotSpeed);
+                player.dirY = oldDirX * Math.sin(-rotSpeed) + player.dirY * Math.cos(-rotSpeed);
+                const oldPlaneX = player.planeX;
+                player.planeX = player.planeX * Math.cos(-rotSpeed) - player.planeY * Math.sin(-rotSpeed);
+                player.planeY = oldPlaneX * Math.sin(-rotSpeed) + player.planeY * Math.cos(-rotSpeed);
+            }
+            
+            // Movement
+            if (keys['w'] || keys['W']) {
+                const newX = player.x + player.dirX * moveSpeed;
+                const newY = player.y + player.dirY * moveSpeed;
+                if (!isWall(newX, player.y)) player.x = newX;
+                if (!isWall(player.x, newY)) player.y = newY;
+                player.walkTimer += deltaTime;
+            }
+            if (keys['s'] || keys['S']) {
+                const newX = player.x - player.dirX * moveSpeed;
+                const newY = player.y - player.dirY * moveSpeed;
+                if (!isWall(newX, player.y)) player.x = newX;
+                if (!isWall(player.x, newY)) player.y = newY;
+                player.walkTimer += deltaTime;
+            }
+            if (keys['a'] || keys['A']) {
+                const newX = player.x - player.planeX * moveSpeed;
+                const newY = player.y - player.planeY * moveSpeed;
+                if (!isWall(newX, player.y)) player.x = newX;
+                if (!isWall(player.x, newY)) player.y = newY;
+                player.walkTimer += deltaTime;
+            }
+            if (keys['d'] || keys['D']) {
+                const newX = player.x + player.planeX * moveSpeed;
+                const newY = player.y + player.planeY * moveSpeed;
+                if (!isWall(newX, player.y)) player.x = newX;
+                if (!isWall(player.x, newY)) player.y = newY;
+                player.walkTimer += deltaTime;
+            }
+        }
+
+        // Game loop
+        let lastTime = 0;
+        function gameLoop(currentTime) {
+            const deltaTime = currentTime - lastTime;
+            lastTime = currentTime;
+            
+            // Update game systems
+            updatePlayer(deltaTime);
+            updateWeapon(deltaTime);
+            handleAutoFire(player, keys);
+            updateProjectiles(deltaTime, player, enemies);
+            
+            // Render the scene
+            const weapon = getCurrentWeapon();
+            render(player, sprites, weapon, 'playing', {});
+            
+            // Enhanced HUD with weapon info
+            ctx.fillStyle = 'rgba(0, 0, 100, 0.8)';
+            ctx.fillRect(0, SCREEN_HEIGHT - HUD_HEIGHT, SCREEN_WIDTH, HUD_HEIGHT);
+            
+            // Left side - Position and movement
+            ctx.fillStyle = 'white';
+            ctx.font = '14px monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText(`Pos: ${Math.floor(player.x)}, ${Math.floor(player.y)}`, 10, SCREEN_HEIGHT - 60);
+            ctx.fillText(`Health: ${player.health}/${player.maxHealth}`, 10, SCREEN_HEIGHT - 45);
+            ctx.fillText(`Ammo: ${player.ammo}/${player.maxAmmo}`, 10, SCREEN_HEIGHT - 30);
+            ctx.fillText(`Lives: ${player.lives}`, 10, SCREEN_HEIGHT - 15);
+            
+            // Center - Weapon info
+            const weaponStats = getWeaponStats();
+            const gameStats = getGameStats();
+            const projectiles = getProjectiles();
+            
+            ctx.textAlign = 'center';
+            ctx.fillText(`Weapon: ${weaponStats.weaponName}`, SCREEN_WIDTH/2, SCREEN_HEIGHT - 60);
+            ctx.fillText(`State: ${weaponStats.weaponState}`, SCREEN_WIDTH/2, SCREEN_HEIGHT - 45);
+            ctx.fillText(`Damage: ${weaponStats.damage}`, SCREEN_WIDTH/2, SCREEN_HEIGHT - 30);
+            ctx.fillText(`Projectiles: ${projectiles.player.length}`, SCREEN_WIDTH/2, SCREEN_HEIGHT - 15);
+            
+            // Right side - Game stats
+            ctx.textAlign = 'right';
+            ctx.fillText(`Score: ${gameStats.score}`, SCREEN_WIDTH - 10, SCREEN_HEIGHT - 60);
+            ctx.fillText(`Shots: ${gameStats.shotsFired}`, SCREEN_WIDTH - 10, SCREEN_HEIGHT - 45);
+            ctx.fillText(`Hits: ${gameStats.shotsHit}`, SCREEN_WIDTH - 10, SCREEN_HEIGHT - 30);
+            ctx.fillText(`Enemies: ${gameStats.enemiesKilled}`, SCREEN_WIDTH - 10, SCREEN_HEIGHT - 15);
+            
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Initialize game
+        async function initGame() {
+            try {
+                document.getElementById('status').textContent = 'Loading assets...';
+                await loadAllAssets();
+                
+                document.getElementById('status').textContent = 'Weapons module loaded! Press R to draw weapon, 1/2 to switch.';
+                console.log('All modules loaded successfully!');
+                
+                // Start game loop
+                requestAnimationFrame(gameLoop);
+                
+            } catch (error) {
+                document.getElementById('status').textContent = 'Error loading modules: ' + error;
+                console.error('Error loading modules:', error);
+                
+                // Draw error screen
+                ctx.fillStyle = '#220000';
+                ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+                ctx.fillStyle = 'red';
+                ctx.font = '20px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('Error loading weapons module', SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+                ctx.fillText(error.message, SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 40);
+            }
+        }
+
+        // Start initialization
+        initGame();
+        
+    </script>
+</body>
+</html>
